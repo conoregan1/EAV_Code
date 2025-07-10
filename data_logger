@@ -1,0 +1,282 @@
+#include <Wire.h>
+#include <TinyGPS++.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "time.h"
+
+// ===================================================================
+// ==                  FILL IN YOUR DETAILS HERE                    ==
+// ===================================================================
+const char* ssid = "Conor_iPhone";       // Your phone's Wi-Fi hotspot name
+const char* password = "esp32_esp32"; // Your phone's Wi-Fi password
+const char* ifttt_key = "gdomOguBGJt5CluJ-NZWIxBFV6q1daBADZwPt3zLI4u";          // Your secret key from the Webhooks Documentation page
+// ===================================================================
+
+// --- IFTTT Event Names ---
+const String event_power_on = "power_on";
+const String event_gps_connected = "gps_connected";
+const String event_gps_lost = "gps_lost";
+const String event_gps_stale = "gps_stale"; // New event
+const String event_sd_card_failed = "sd_card_failed";
+const String event_sd_card_reconnected = "sd_card_reconnected";
+const String event_wifi_reconnected = "wifi_reconnected";
+
+// --- NTP Configuration ---
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 0; // For UTC time
+const int daylightOffset_sec = 0;
+
+// --- Pin Definitions & HW Config ---
+#define SD_CS 5
+#define LED_PIN 2
+#define SCK_PIN 18
+#define MISO_PIN 19
+#define MOSI_PIN 23
+
+// --- Timing & Filter Config ---
+unsigned long previousSampleTime = 0;
+const long sampleInterval = 4;
+unsigned long previousPrintTime = 0;
+const long printInterval = 1000;
+const float Q_angle = 0.002f;
+const float R_measure = 0.5f;
+const unsigned long gpsDebounceDelay = 10000;
+const unsigned long gpsStaleTimeout = 300000; // 5 minutes in milliseconds
+
+// --- Motion & State Tracking ---
+float smoothedAccelMag = 1.0;
+const float motionThreshold = 0.08;
+TinyGPSPlus gps;
+File dataFile;
+Adafruit_MPU6050 mpu;
+bool gpsIsConnected = false;
+bool sdCardIsWorking = true;
+bool wifiIsConnected = true;
+unsigned long gpsLossTimestamp = 0;
+bool isMoving = false;
+double lastLat = 0.0, lastLon = 0.0;
+unsigned long lastLocationTime = 0;
+bool staleNoticeSent = false;
+
+// --- Global sensor variables & Kalman state ---
+float roll = 0, pitch = 0, yaw = 0;
+float accelX = 0, accelY = 0, accelZ = 0;
+float gyro_x_offset = 0, gyro_y_offset = 0, gyro_z_offset = 0;
+float kalman_angle_roll = 0, kalman_uncertainty_angle_roll = 4;
+float kalman_angle_pitch = 0, kalman_uncertainty_angle_pitch = 4;
+float kalman_output[] = {0, 0};
+
+// -- Function Prototypes --
+void calibrate_gyro();
+void kalman_1d(float &state, float &uncertainty, float input, float measurement, float dt);
+void sendIFTTTNotification(String event);
+void connectToWifi();
+String getFormattedTime();
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  delay(100);
+  Serial.begin(9600);
+  Wire.begin();
+  if (!mpu.begin()) { while (1); }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
+  calibrate_gyro();
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SD_CS);
+  if (!SD.begin(SD_CS)) { sdCardIsWorking = false; }
+  connectToWifi();
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  sendIFTTTNotification(event_power_on);
+  if(!sdCardIsWorking){ sendIFTTTNotification("sd_card_failed"); }
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Check Wi-Fi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiIsConnected) { wifiIsConnected = false; }
+    connectToWifi();
+  } else {
+    if (!wifiIsConnected) {
+      wifiIsConnected = true;
+      sendIFTTTNotification("wifi_reconnected");
+    }
+  }
+
+  // FAST SAMPLING LOOP
+  if (currentTime - previousSampleTime >= sampleInterval) {
+    float dt = (currentTime - previousSampleTime) / 1000.0;
+    previousSampleTime = currentTime;
+
+    while (Serial.available() > 0) {
+      gps.encode(Serial.read());
+    }
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    accelX = a.acceleration.x;
+    accelY = a.acceleration.y;
+    accelZ = a.acceleration.z;
+
+    float currentAccelMag = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ) / 9.81;
+    smoothedAccelMag = (smoothedAccelMag * 0.95) + (currentAccelMag * 0.05);
+    isMoving = (abs(smoothedAccelMag - 1.0) > motionThreshold);
+
+    if (gps.satellites.value() >= 4) {
+      if (!gpsIsConnected) {
+        gpsIsConnected = true;
+        gpsLossTimestamp = 0;
+        sendIFTTTNotification(event_gps_connected);
+      }
+    } else {
+      if (gpsIsConnected) {
+        if (isMoving) { gpsLossTimestamp = currentTime; }
+        gpsIsConnected = false;
+      }
+    }
+
+    if (gpsLossTimestamp > 0 && (currentTime - gpsLossTimestamp > gpsDebounceDelay)) {
+      sendIFTTTNotification(event_gps_lost);
+      gpsLossTimestamp = 0;
+    }
+
+    float gyro_roll = g.gyro.x - gyro_x_offset;
+    float gyro_pitch = g.gyro.y - gyro_y_offset;
+    float gyro_yaw = g.gyro.z - gyro_z_offset;
+
+    // --- Yaw Calculation with GPS Correction ---
+    yaw = yaw + gyro_yaw * dt; // Gyro integration
+    // GPS course is only valid when moving
+    if (gps.speed.kmph() > 2.0 && gps.course.isValid()) {
+      float gps_course = gps.course.deg();
+      // Complementary filter to fuse gyro yaw with GPS course
+      yaw = (0.98 * yaw) + (0.02 * gps_course);
+    }
+    // Keep yaw between 0 and 360 degrees
+    if(yaw < 0) yaw += 360;
+    if(yaw >= 360) yaw -= 360;
+
+    float roll_acc = atan2(accelY, accelZ) * 180 / M_PI;
+    float pitch_acc = atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ)) * 180 / M_PI;
+    kalman_1d(kalman_angle_roll, kalman_uncertainty_angle_roll, gyro_roll, roll_acc, dt);
+    roll = kalman_output[0];
+    kalman_1d(kalman_angle_pitch, kalman_uncertainty_angle_pitch, gyro_pitch, pitch_acc, dt);
+    pitch = kalman_output[0];
+  }
+
+  // SLOW LOGGING AND STALE GPS CHECK LOOP
+  if (currentTime - previousPrintTime >= printInterval) {
+    previousPrintTime = currentTime;
+
+    // --- Stale GPS Location Check ---
+    if (gps.location.isValid()) {
+      if (abs(gps.location.lat() - lastLat) < 0.00001 && abs(gps.location.lng() - lastLon) < 0.00001) {
+        // Location is the same as last time. Check if 5 minutes have passed.
+        if (lastLocationTime > 0 && (currentTime - lastLocationTime > gpsStaleTimeout) && !staleNoticeSent) {
+          sendIFTTTNotification(event_gps_stale);
+          staleNoticeSent = true; // Prevent sending again
+        }
+      } else {
+        // New location detected, update trackers
+        lastLat = gps.location.lat();
+        lastLon = gps.location.lng();
+        lastLocationTime = currentTime;
+        staleNoticeSent = false; // Reset the notice flag
+      }
+    }
+    
+    // --- SD Card Logging ---
+    dataFile = SD.open("/data.txt", FILE_APPEND);
+    if (dataFile) {
+      if (!sdCardIsWorking) { sendIFTTTNotification("sd_card_reconnected"); }
+      sdCardIsWorking = true;
+      
+      dataFile.print("Time: ");
+      dataFile.print(getFormattedTime());
+      dataFile.print(" | GPS: ");
+      if (gps.location.isValid()) {
+        dataFile.print(gps.location.lat(), 6); dataFile.print(", ");
+        dataFile.print(gps.location.lng(), 6);
+      } else { dataFile.print("Invalid"); }
+      dataFile.print(" | Accel: ");
+      dataFile.print(accelX, 4); dataFile.print(", ");
+      dataFile.print(accelY, 4); dataFile.print(", ");
+      dataFile.print(accelZ, 4);
+      dataFile.print(" | Roll: "); dataFile.print(roll);
+      dataFile.print(" | Pitch: "); dataFile.print(pitch);
+      dataFile.print(" | Yaw: "); dataFile.println(yaw);
+      dataFile.close();
+    } else {
+      if (sdCardIsWorking) { sendIFTTTNotification("sd_card_failed"); }
+      sdCardIsWorking = false;
+    }
+  }
+}
+void connectToWifi(){
+  if(WiFi.status() == WL_CONNECTED) return;
+  digitalWrite(LED_PIN, HIGH);
+  WiFi.begin(ssid, password);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    retries++;
+  }
+  digitalWrite(LED_PIN, LOW);
+}
+
+void sendIFTTTNotification(String event) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "http://maker.ifttt.com/trigger/" + event + "/with/key/" + ifttt_key;
+  http.begin(url);
+  http.GET();
+  http.end();
+}
+
+void kalman_1d(float &kalman_state, float &kalman_uncertainty, float kalman_input, float kalman_measurement, float dt) {
+    kalman_state += dt * kalman_input;
+    kalman_uncertainty += dt * dt * Q_angle * Q_angle;
+    float kalman_gain = kalman_uncertainty / (kalman_uncertainty + R_measure * R_measure);
+    kalman_state += kalman_gain * (kalman_measurement - kalman_state);
+    kalman_uncertainty *= (1 - kalman_gain);
+    kalman_output[0] = kalman_state;
+    kalman_output[1] = kalman_uncertainty;
+}
+
+void calibrate_gyro() {
+  long cal_start = millis();
+  while(millis() - cal_start < 4000){
+    digitalWrite(LED_PIN, HIGH); delay(50);
+    digitalWrite(LED_PIN, LOW); delay(50);
+  }
+  const int num_readings = 1000;
+  sensors_event_t a, g, temp;
+  for (int i = 0; i < num_readings; i++) {
+    mpu.getEvent(&a, &g, &temp);
+    gyro_x_offset += g.gyro.x;
+    gyro_y_offset += g.gyro.y;
+    gyro_z_offset += g.gyro.z;
+    delay(3);
+  }
+  gyro_x_offset /= num_readings;
+  gyro_y_offset /= num_readings;
+  gyro_z_offset /= num_readings;
+}
+
+String getFormattedTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "Time not synced";
+  }
+  char timeString[20];
+  // ✅ CORRECTED: Format string now only includes Hour, Minute, and Second
+  strftime(timeString, sizeof(timeString), "%H:%M:%S", &timeinfo);
+  return String(timeString);
+}
