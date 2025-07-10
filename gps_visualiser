@@ -1,0 +1,88 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.ticker import FuncFormatter
+from datetime import datetime
+import os
+from text_to_excel import process_data_file # Import the processing function
+
+def plot_gps_data(csv_file_path):
+    """
+    Reads GPS data from a CSV file, plots the latitude and longitude,
+    and colors the points based on time, transitioning from red to green to blue.
+    Handles HH:MM:S time format.
+    """
+    try:
+        # Read the CSV file into a pandas DataFrame
+        df = pd.read_csv(csv_file_path)
+
+        # --- Data Validation ---
+        required_columns = ['Lat', 'Long', 'Time']
+        if not all(col in df.columns for col in required_columns):
+            print(f"Error: CSV file must contain the columns: {required_columns}")
+            return
+
+        # --- Data Processing ---
+        # Drop rows where GPS data is invalid
+        df.dropna(subset=['Lat', 'Long'], inplace=True)
+        if df.empty:
+            print("No valid GPS coordinates to plot.")
+            return
+
+        # Convert HH:MM:S time string to datetime objects
+        df['time_dt'] = pd.to_datetime(df['Time'], format='%H:%M:%S')
+        df.sort_values('time_dt', inplace=True)
+
+        # Create a numerical representation of time (seconds from the start) for color mapping
+        time_numeric = (df['time_dt'] - df['time_dt'].min()).dt.total_seconds()
+
+        # --- Plotting ---
+        fig, ax = plt.subplots(figsize=(10, 10))
+        cmap_red_green_blue = mcolors.LinearSegmentedColormap.from_list("RedGreenBlue", ["red", "green", "blue"])
+        scatter = ax.scatter(df['Long'], df['Lat'], c=time_numeric, cmap=cmap_red_green_blue, s=15, alpha=0.7)
+
+        # --- Formatting and Labels ---
+        cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Time Progression (from start)', rotation=270, labelpad=20)
+        
+        # Format color bar to show H:M:S
+        min_time = df['time_dt'].min()
+        formatter = FuncFormatter(lambda s, x: (min_time + pd.to_timedelta(s, unit='s')).strftime('%H:%M:%S'))
+        cbar.ax.yaxis.set_major_formatter(formatter)
+
+        ax.set_title('GPS Path Visualization', fontsize=16)
+        ax.set_xlabel('Longitude', fontsize=12)
+        ax.set_ylabel('Latitude', fontsize=12)
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, linestyle='--', alpha=0.6)
+        plt.show()
+
+    except FileNotFoundError:
+        print(f"Error: The file '{csv_file_path}' was not found.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def main():
+    """
+    Main function to process the raw data and then visualize it.
+    """
+    # Define paths
+    data_file_path = 'D:/data.txt'
+    output_directory = 'C:/Users/44753/Downloads/EAV_data/'
+
+    # Step 1: Run the text_to_excel script to process the data
+    process_data_file(data_file_path, output_directory)
+
+    # Step 2: Dynamically determine the CSV file path for the current day
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    csv_file_path = os.path.join(output_directory, f'{current_date}.csv')
+
+    # Step 3: Plot the data from the newly processed file
+    if os.path.exists(csv_file_path):
+        plot_gps_data(csv_file_path)
+    else:
+        print(f"Error: Today's data file could not be found or created at '{csv_file_path}'")
+
+# --- Execution ---
+if __name__ == "__main__":
+    main()
