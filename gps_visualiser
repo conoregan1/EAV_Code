@@ -1,90 +1,107 @@
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.ticker import FuncFormatter
 from datetime import datetime
 import os
 import contextily as cx
 from text_to_excel import process_data_file
 
+# -----------------------
+# Constants
+# -----------------------
+GPS_INITIAL_LOCK = 5  # seconds to ignore at start
+MAX_REALISTIC_ACCEL = 5.0  # m/s², maximum plausible acceleration
+SMOOTHING_WINDOW = 3  # number of points for rolling average smoothing
 
-def plot_gps_data(csv_file_path):
+# -----------------------
+# Haversine distance
+# -----------------------
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371000  # meters
+    lat1 = np.radians(lat1)
+    lat2 = np.radians(lat2)
+    dlat = lat2 - lat1
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
+
+# -----------------------
+# Compute GPS velocity
+# -----------------------
+def compute_gps_velocity(df):
+    velocities = [0]
+    times = df['Time_sec'].values
+    for i in range(1, len(df)):
+        dt = times[i] - times[i-1]
+        if dt == 0:
+            velocities.append(0)
+            continue
+        distance = haversine_distance(df['Lat'].iloc[i-1], df['Long'].iloc[i-1],
+                                      df['Lat'].iloc[i], df['Long'].iloc[i])
+        v = distance / dt
+        velocities.append(v)
+    df['gps_velocity'] = velocities
+    return df
+
+# -----------------------
+# Acceleration plausibility filter
+# -----------------------
+def filter_velocity_by_acceleration(df):
+    filtered = df.copy()
+    for i in range(1, len(df)):
+        dv = abs(filtered['gps_velocity'].iloc[i] - filtered['gps_velocity'].iloc[i-1])
+        dt = filtered['Time_sec'].iloc[i] - filtered['Time_sec'].iloc[i-1]
+        if dt == 0:
+            continue
+        max_dv = MAX_REALISTIC_ACCEL * dt
+        if dv > max_dv:
+            # Replace unrealistic velocity with previous value
+            filtered.at[i, 'gps_velocity'] = filtered['gps_velocity'].iloc[i-1]
+    return filtered
+
+# -----------------------
+# Smooth velocity
+# -----------------------
+def smooth_velocity(df, window=3):
+    df['velocity_smoothed'] = df['gps_velocity'].rolling(window=window, min_periods=1, center=True).mean()
+    return df
+
+# -----------------------
+# Plot map coloured by velocity
+# -----------------------
+def plot_velocity_map(df):
+    fig, ax = plt.subplots(figsize=(12,12))
+    cmap = mcolors.LinearSegmentedColormap.from_list("VelocityMap", ["blue","green","yellow","red"])
+    scatter = ax.scatter(df['Long'], df['Lat'], c=df['velocity_smoothed'], cmap=cmap, s=25, alpha=0.8, zorder=2)
     try:
-        df = pd.read_csv(csv_file_path)
-
-        # --- Data Validation ---
-        required_columns = ['Lat', 'Long', 'Time']
-        if not all(col in df.columns for col in required_columns):
-            print(f"Error: CSV file must contain the columns: {required_columns}")
-            return
-
-        # --- Data Processing ---
-        df.dropna(subset=['Lat', 'Long'], inplace=True)
-        if df.empty:
-            print("No valid GPS coordinates to plot.")
-            return
-
-        df['time_dt'] = pd.to_datetime(df['Time'], format='%H:%M:%S')
-        df.sort_values('time_dt', inplace=True)
-        time_numeric = (df['time_dt'] - df['time_dt'].min()).dt.total_seconds()
-
-        # --- Plotting ---
-        fig, ax = plt.subplots(figsize=(12, 12))
-
-        cmap_rgb = mcolors.LinearSegmentedColormap.from_list(
-            "RedGreenBlue", ["red", "green", "blue"]
-        )
-
-        # Plot directly in latitude/longitude
-        scatter = ax.scatter(
-            df['Long'],
-            df['Lat'],
-            c=time_numeric,
-            cmap=cmap_rgb,
-            s=25,
-            alpha=0.8,
-            zorder=2
-        )
-
-        # --- Add OSM Map Overlay ---
-        # Tell contextily that the axes are in lat/long (EPSG:4326)
-        try:
-            cx.add_basemap(
-                ax,
-                source=cx.providers.OpenStreetMap.Mapnik,
-                crs="EPSG:4326",
-                zoom='auto'
-            )
-        except Exception as e:
-            print(f"Warning: Could not load map tiles: {e}")
-
-        # --- Formatting and Labels ---
-        cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label('Time Progression (from start)', rotation=270, labelpad=20)
-
-        min_time = df['time_dt'].min()
-        formatter = FuncFormatter(
-            lambda s, x: (min_time + pd.to_timedelta(s, unit='s')).strftime('%H:%M:%S')
-        )
-        cbar.ax.yaxis.set_major_formatter(formatter)
-
-        ax.set_title(
-            f'GPS Path - {datetime.now().strftime("%Y-%m-%d")}',
-            fontsize=16
-        )
-
-        # Make map look square
-        ax.set_aspect('equal')
-
-        plt.tight_layout()
-        plt.show()
-
-    except FileNotFoundError:
-        print(f"Error: The file '{csv_file_path}' was not found.")
+        cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik, crs="EPSG:4326", zoom='auto')
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"Warning: Could not load map tiles: {e}")
+    cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Velocity (m/s)", rotation=270, labelpad=20)
+    ax.set_title(f"GPS Velocity Map - {datetime.now().strftime('%Y-%m-%d')}", fontsize=16)
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.show()
 
+# -----------------------
+# Plot velocity vs time
+# -----------------------
+def plot_velocity_vs_time(df):
+    plt.figure(figsize=(12,6))
+    plt.plot(df['Time_sec'], df['velocity_smoothed'], color='blue', linewidth=2)
+    plt.xlabel("Time (seconds from start)")
+    plt.ylabel("Velocity (m/s)")
+    plt.title("Velocity vs Time (GPS filtered + smoothed)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
+# -----------------------
+# Main script
+# -----------------------
 def main():
     data_file_path = 'D:/data.txt'
     output_directory = 'C:/Users/conor/OneDrive/Documents/EAV_Data'
@@ -92,16 +109,43 @@ def main():
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
 
+    # Process raw data to CSV
     process_data_file(data_file_path, output_directory)
-
     current_date = datetime.now().strftime('%Y-%m-%d')
     csv_file_path = os.path.join(output_directory, f'{current_date}.csv')
+    if not os.path.exists(csv_file_path):
+        print(f"Error: CSV file not found at {csv_file_path}")
+        return
 
-    if os.path.exists(csv_file_path):
-        plot_gps_data(csv_file_path)
-    else:
-        print(f"Error: Today's data file could not be found at '{csv_file_path}'")
+    df = pd.read_csv(csv_file_path)
+    df['time_dt'] = pd.to_datetime(df['Time'], format='%H:%M:%S')
+    df['Time_sec'] = (df['time_dt'] - df['time_dt'].min()).dt.total_seconds()
 
+    # -----------------------
+    # Ignore initial GPS lock
+    # -----------------------
+    df = df[df['Time_sec'] > GPS_INITIAL_LOCK].reset_index(drop=True)
+
+    # -----------------------
+    # Compute GPS velocity
+    # -----------------------
+    df = compute_gps_velocity(df)
+
+    # -----------------------
+    # Filter unrealistic velocities using acceleration (plausibility check)
+    # -----------------------
+    df = filter_velocity_by_acceleration(df)
+
+    # -----------------------
+    # Smooth velocity with small window
+    # -----------------------
+    df = smooth_velocity(df, window=SMOOTHING_WINDOW)
+
+    # -----------------------
+    # Plots
+    # -----------------------
+    plot_velocity_map(df)
+    plot_velocity_vs_time(df)
 
 if __name__ == "__main__":
     main()
