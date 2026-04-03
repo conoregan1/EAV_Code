@@ -14,35 +14,57 @@ GPS_INITIAL_LOCK    = 5      # seconds to ignore at start
 MAX_REALISTIC_ACCEL = 20.0   # m/s², maximum plausible acceleration
 SMOOTHING_WINDOW    = 3      # number of points for rolling average smoothing
 
+
+# -----------------------
+# Time parsing
+# -----------------------
+def parse_time_to_seconds(df):
+    """
+    Convert the Time column (HH:MM:SS.mmm from process_data.py) to
+    a numerical Time_sec column (seconds from the start of the run).
+    Also handles the old HH:MM:SS format without milliseconds.
+    """
+    parsed = (
+        pd.to_datetime(df['Time'], format='%H:%M:%S.%f', errors='coerce')
+        .fillna(pd.to_datetime(df['Time'], format='%H:%M:%S', errors='coerce'))
+    )
+    df['Time_sec'] = (parsed - parsed.min()).dt.total_seconds()
+    return df
+
+
 # -----------------------
 # Haversine distance
 # -----------------------
 def haversine_distance(lat1, lon1, lat2, lon2):
-    R = 6371000
+    R    = 6371000
     lat1 = np.radians(lat1)
     lat2 = np.radians(lat2)
     dlat = lat2 - lat1
     dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    a    = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c    = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
+
 
 # -----------------------
 # Compute GPS velocity
 # -----------------------
 def compute_gps_velocity(df):
     velocities = [0]
-    times = df['Time_sec'].values
+    times      = df['Time_sec'].values
     for i in range(1, len(df)):
-        dt = times[i] - times[i-1]
+        dt = times[i] - times[i - 1]
         if dt == 0:
             velocities.append(0)
             continue
-        distance = haversine_distance(df['Lat'].iloc[i-1], df['Long'].iloc[i-1],
-                                      df['Lat'].iloc[i],   df['Long'].iloc[i])
+        distance = haversine_distance(
+            df['Lat'].iloc[i - 1], df['Long'].iloc[i - 1],
+            df['Lat'].iloc[i],     df['Long'].iloc[i]
+        )
         velocities.append(distance / dt)
     df['gps_velocity'] = velocities
     return df
+
 
 # -----------------------
 # Acceleration plausibility filter
@@ -50,13 +72,14 @@ def compute_gps_velocity(df):
 def filter_velocity_by_acceleration(df):
     filtered = df.copy()
     for i in range(1, len(df)):
-        dv = abs(filtered['gps_velocity'].iloc[i] - filtered['gps_velocity'].iloc[i-1])
-        dt = filtered['Time_sec'].iloc[i] - filtered['Time_sec'].iloc[i-1]
+        dv = abs(filtered['gps_velocity'].iloc[i] - filtered['gps_velocity'].iloc[i - 1])
+        dt = filtered['Time_sec'].iloc[i] - filtered['Time_sec'].iloc[i - 1]
         if dt == 0:
             continue
         if dv > MAX_REALISTIC_ACCEL * dt:
-            filtered.at[i, 'gps_velocity'] = filtered['gps_velocity'].iloc[i-1]
+            filtered.at[i, 'gps_velocity'] = filtered['gps_velocity'].iloc[i - 1]
     return filtered
+
 
 # -----------------------
 # Smooth velocity
@@ -69,26 +92,30 @@ def smooth_velocity(df, window=3):
     )
     return df
 
+
 # -----------------------
-# Build battery DataFrame from CSV columns (Battery_Voltage_V, Battery_Charge_pct)
+# Battery data
 # -----------------------
 def load_battery_data_from_df(df):
     """
-    Extract battery readings directly from Battery_Voltage_V / Battery_Charge_pct
-    columns already present in the CSV. Only rows where at least one battery
-    column is non-NaN are kept.
+    Extract battery readings from Battery_Voltage_V / Battery_Charge_pct
+    columns if present in the xlsx.
     """
-    bat_rows = df[df['Battery_Voltage_V'].notna() | df['Battery_Charge_pct'].notna()].copy()
-    bat_rows = bat_rows.rename(columns={'Battery_Charge_pct': 'Battery_Charge_pct'})
+    bat_rows = df[
+        df['Battery_Voltage_V'].notna() | df['Battery_Charge_pct'].notna()
+    ].copy()
     bat_rows['has_gps'] = bat_rows['Lat'].notna()
-    return bat_rows[['Time_sec', 'Battery_Voltage_V', 'Battery_Charge_pct', 'Lat', 'Long', 'has_gps']].reset_index(drop=True)
+    return bat_rows[[
+        'Time_sec', 'Battery_Voltage_V', 'Battery_Charge_pct',
+        'Lat', 'Long', 'has_gps'
+    ]].reset_index(drop=True)
+
 
 # -----------------------
-# Plot map coloured by velocity + battery markers
+# Plot map coloured by velocity
 # -----------------------
 def plot_velocity_map(df, df_bat):
     fig, ax = plt.subplots(figsize=(12, 12))
-
     cmap    = mcolors.LinearSegmentedColormap.from_list(
         "VelocityMap", ["blue", "green", "yellow", "red"]
     )
@@ -97,14 +124,14 @@ def plot_velocity_map(df, df_bat):
         c=df['velocity_smoothed'], cmap=cmap,
         s=25, alpha=0.8, zorder=2
     )
-
     try:
-        cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik,
-                       crs="EPSG:4326", zoom='auto')
+        cx.add_basemap(
+            ax, source=cx.providers.OpenStreetMap.Mapnik,
+            crs="EPSG:4326", zoom='auto'
+        )
     except Exception as e:
-        print(f"Warning: Could not load map tiles: {e}")
+        print(f"Warning: could not load map tiles: {e}")
 
-    # Red crosses at GPS-matched battery readings
     gps_bat = df_bat[df_bat['has_gps']].copy()
     if not gps_bat.empty:
         ax.scatter(
@@ -117,12 +144,13 @@ def plot_velocity_map(df, df_bat):
     cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Velocity (m/s)", rotation=270, labelpad=20)
     ax.set_title(
-        f"GPS Velocity Map with Battery Readings — {datetime.now().strftime('%Y-%m-%d')}",
+        f"GPS Velocity Map — {datetime.now().strftime('%Y-%m-%d')}",
         fontsize=16
     )
     ax.set_aspect('equal')
     plt.tight_layout()
     plt.show()
+
 
 # -----------------------
 # Plot velocity vs time
@@ -137,83 +165,98 @@ def plot_velocity_vs_time(df):
     plt.tight_layout()
     plt.show()
 
+
 # -----------------------
-# Plot battery voltage and charge % over time (two subplots)
+# Plot battery over time
 # -----------------------
 def plot_battery(df_bat):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     fig.suptitle("Battery Data Over Time", fontsize=16)
 
-    # ── Voltage ──
-    ax1.plot(df_bat['Time_sec'], df_bat['Battery_Voltage_V'],
-             color='darkorange', linewidth=2, marker='o', markersize=5)
+    ax1.plot(
+        df_bat['Time_sec'], df_bat['Battery_Voltage_V'],
+        color='darkorange', linewidth=2, marker='o', markersize=5
+    )
     ax1.set_ylabel("Battery Voltage (V)", fontsize=12)
     ax1.grid(True, alpha=0.3)
     ax1.set_title("Battery Voltage")
-
-    # Mark GPS-matched points
     gps_bat = df_bat[df_bat['has_gps']]
-    ax1.scatter(gps_bat['Time_sec'], gps_bat['Battery_Voltage_V'],
-                marker='x', color='red', s=80, linewidths=2,
-                zorder=5, label='GPS location available')
+    ax1.scatter(
+        gps_bat['Time_sec'], gps_bat['Battery_Voltage_V'],
+        marker='x', color='red', s=80, linewidths=2,
+        zorder=5, label='GPS location available'
+    )
     ax1.legend(fontsize=10)
 
-    # ── Charge % ──
     charge_known = df_bat[df_bat['Battery_Charge_pct'].notna()]
-    ax2.plot(charge_known['Time_sec'], charge_known['Battery_Charge_pct'],
-             color='steelblue', linewidth=2, marker='o', markersize=5)
+    ax2.plot(
+        charge_known['Time_sec'], charge_known['Battery_Charge_pct'],
+        color='steelblue', linewidth=2, marker='o', markersize=5
+    )
     ax2.set_ylabel("Battery Charge (%)", fontsize=12)
     ax2.set_xlabel("Time (seconds from journey start)", fontsize=12)
     ax2.set_ylim(0, 105)
     ax2.grid(True, alpha=0.3)
     ax2.set_title("Battery State of Charge")
-
     gps_charge = charge_known[charge_known['has_gps']]
-    ax2.scatter(gps_charge['Time_sec'], gps_charge['Battery_Charge_pct'],
-                marker='x', color='red', s=80, linewidths=2,
-                zorder=5, label='GPS location available')
+    ax2.scatter(
+        gps_charge['Time_sec'], gps_charge['Battery_Charge_pct'],
+        marker='x', color='red', s=80, linewidths=2,
+        zorder=5, label='GPS location available'
+    )
     ax2.legend(fontsize=10)
-
     plt.tight_layout()
     plt.show()
 
+
 # -----------------------
-# Main script
+# Main
 # -----------------------
 def main():
-    data_file_path   = 'D:/data.txt'
+    data_file_path   = 'D:/data.bin'           # ← updated from data.txt
     output_directory = 'C:/Users/conor/OneDrive/Documents/EAV_Data'
 
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
 
     process_data_file(data_file_path, output_directory)
+
     current_date = datetime.now().strftime('%Y-%m-%d')
-    csv_file_path = os.path.join(output_directory, f'{current_date}.csv')
-    if not os.path.exists(csv_file_path):
-        print(f"Error: CSV file not found at {csv_file_path}")
+    xlsx_path    = os.path.join(output_directory, f'{current_date}.xlsx')  # ← .xlsx
+
+    if not os.path.exists(xlsx_path):
+        print(f"Error: file not found at {xlsx_path}")
         return
 
-    df = pd.read_csv(csv_file_path)
-    df['time_dt']  = pd.to_datetime(df['Time'], format='%H:%M:%S')
-    df['Time_sec'] = (df['time_dt'] - df['time_dt'].min()).dt.total_seconds()
+    df = pd.read_excel(xlsx_path)              # ← read_excel, not read_csv
 
+    df = parse_time_to_seconds(df)             # ← handles HH:MM:SS.mmm
     df = df[df['Time_sec'] > GPS_INITIAL_LOCK].reset_index(drop=True)
+
     df = compute_gps_velocity(df)
     df = filter_velocity_by_acceleration(df)
     df = smooth_velocity(df, window=SMOOTHING_WINDOW)
 
-    # Load battery data from CSV columns
-    has_battery_cols = ('Battery_Voltage_V' in df.columns and 'Battery_Charge_pct' in df.columns)
+    has_battery_cols = (
+        'Battery_Voltage_V'  in df.columns and
+        'Battery_Charge_pct' in df.columns
+    )
+
+    empty_bat = pd.DataFrame(columns=[
+        'Time_sec', 'Battery_Voltage_V', 'Battery_Charge_pct',
+        'Lat', 'Long', 'has_gps'
+    ])
+
     if has_battery_cols:
         df_bat = load_battery_data_from_df(df)
         plot_velocity_map(df, df_bat)
         plot_velocity_vs_time(df)
         plot_battery(df_bat)
     else:
-        print("No battery columns found in CSV — skipping battery plots.")
-        plot_velocity_map(df, pd.DataFrame(columns=['Time_sec', 'Battery_Voltage_V', 'Battery_Charge_pct', 'Lat', 'Long', 'has_gps']))
+        print("No battery columns found — skipping battery plots.")
+        plot_velocity_map(df, empty_bat)
         plot_velocity_vs_time(df)
+
 
 if __name__ == "__main__":
     main()
