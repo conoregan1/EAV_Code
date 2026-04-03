@@ -1,112 +1,231 @@
+// ===================================================================
+// == ESP32 Sensor Logger — Binary Format                 v1.1.2  ==
+// ==                                                              ==
+// == v1.1.2 fix: true millisecond timestamps.                    ==
+// ==   GPS NMEA updates at 1Hz — gps.time.centisecond() is the   ==
+// ==   centisecond of the fix, not an incrementing counter, so   ==
+// ==   all samples in a given second got identical time_ms.       ==
+// ==   Fix: when the GPS second ticks over, record millis() at   ==
+// ==   that moment. Each sample then adds (millis() - anchor) to  ==
+// ==   the GPS wall-clock second, giving true 1ms precision       ==
+// ==   timestamps anchored to GPS UTC.                            ==
+// ==                                                              ==
+// == Binary record layout (all little-endian, 38 bytes packed):  ==
+// ==   [0]      uint8   sync byte  (0xAA)                        ==
+// ==   [1–4]    uint32  time_ms  (ms since midnight)             ==
+// ==   [5]      uint8   gps_valid  (1 = location fix, 0 = none)  ==
+// ==   [6–9]    int32   latitude  × 1,000,000                    ==
+// ==   [10–13]  int32   longitude × 1,000,000                    ==
+// ==   [14–17]  float32 accelX                                   ==
+// ==   [18–21]  float32 accelY                                   ==
+// ==   [22–25]  float32 accelZ                                   ==
+// ==   [26–29]  float32 roll                                     ==
+// ==   [30–33]  float32 pitch                                    ==
+// ==   [34–37]  float32 yaw                                      ==
+// ==                                                              ==
+// == File format:                                                 ==
+// ==   Bytes 0–3  : magic "ESPB"                                 ==
+// ==   Bytes 4+   : records back to back                         ==
+// ===================================================================
+
 #include <Wire.h>
 #include <TinyGPS++.h>
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include "time.h"
 #include <MadgwickAHRS.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 // ===================================================================
-// ==                  FILL IN YOUR DETAILS HERE                    ==
+// ==               Binary Record Definition                       ==
 // ===================================================================
-const char* ssid = "Conor_iPhone";
-const char* password = "esp32_esp32";
-const char* ifttt_key = "gdomOguBGJt5CluJ-NZWIxBFV6q1daBADZwPt3zLI4u";
+#define SYNC_BYTE    0xAA
+#define RECORD_SIZE  38
+#define FILE_MAGIC_0 0x45  // 'E'
+#define FILE_MAGIC_1 0x53  // 'S'
+#define FILE_MAGIC_2 0x50  // 'P'
+#define FILE_MAGIC_3 0x42  // 'B'
+
+struct __attribute__((packed)) DataRecord {
+  uint8_t  sync;
+  uint32_t time_ms;    // milliseconds since midnight
+  uint8_t  gps_valid;
+  int32_t  lat_e6;
+  int32_t  lon_e6;
+  float    accelX;
+  float    accelY;
+  float    accelZ;
+  float    roll;
+  float    pitch;
+  float    yaw;
+};
+
+static_assert(sizeof(DataRecord) == RECORD_SIZE,
+              "DataRecord is not 38 bytes — check compiler padding");
+
 // ===================================================================
+// ==                     BLE Configuration                        ==
+// ===================================================================
+#define BLE_DEVICE_NAME  "ESP32_Sensor"
+#define SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define NOTIFY_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define WRITE_CHAR_UUID  "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 
-// --- IFTTT Event Names ---
-const String event_power_on            = "power_on";
-const String event_gps_connected       = "gps_connected";
-const String event_gps_lost            = "gps_lost";
-const String event_gps_stale           = "gps_stale";
-const String event_sd_card_failed      = "sd_card_failed";
-const String event_sd_card_reconnected = "sd_card_reconnected";
-const String event_wifi_reconnected    = "wifi_reconnected";
+BLEServer*         pServer      = nullptr;
+BLECharacteristic* pNotifyChar  = nullptr;
+BLECharacteristic* pWriteChar   = nullptr;
+bool               bleConnected = false;
 
-// --- NTP Configuration ---
-const char* ntpServer        = "pool.ntp.org";
-const long  gmtOffset_sec    = 0;
-const int   daylightOffset_sec = 0;
+// ===================================================================
+// ==                   Logging State                              ==
+// ===================================================================
+enum LogState { LOGGING_OFF, LOGGING_ON, LOGGING_PAUSED };
+LogState logState = LOGGING_OFF;
 
-// --- Pin Definitions ---
+// ===================================================================
+// ==   BLE Command Flags — all volatile, all global               ==
+// ===================================================================
+volatile bool dumpRequested            = false;
+volatile bool cancelDumpRequested      = false;
+volatile bool clearRequested           = false;
+volatile bool startRequested           = false;
+volatile bool pauseRequested           = false;
+volatile bool stopRequested            = false;
+volatile bool statusRequestedOnConnect = false;
+
+// ===================================================================
+// ==   Dump file handle — global so onDisconnect can close it     ==
+// ===================================================================
+File dumpFile;
+
+// ===================================================================
+// ==                   BLE Callbacks                              ==
+// ===================================================================
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) {
+    bleConnected             = true;
+    statusRequestedOnConnect = true;
+    Serial.println("BLE connected");
+  }
+  void onDisconnect(BLEServer* s) {
+    bleConnected        = false;
+    cancelDumpRequested = true;
+    dumpRequested       = false;
+    if (dumpFile) {
+      dumpFile.close();
+      Serial.println("Dump file closed on disconnect");
+    }
+    Serial.println("BLE disconnected — restarting advertising");
+    delay(500);
+    s->startAdvertising();
+    Serial.println("Advertising restarted");
+  }
+};
+
+class WriteCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) {
+    String cmd = pChar->getValue();
+    cmd.trim();
+    if (cmd == "DUMP")       dumpRequested       = true;
+    if (cmd == "CANCELDUMP") cancelDumpRequested = true;
+    if (cmd == "CLEAR")      clearRequested      = true;
+    if (cmd == "START")      startRequested      = true;
+    if (cmd == "PAUSE")      pauseRequested      = true;
+    if (cmd == "STOP")       stopRequested       = true;
+  }
+};
+
+// ===================================================================
+// ==                   Pin Definitions                            ==
+// ===================================================================
 #define SD_CS    5
 #define LED_PIN  2
 #define SCK_PIN  18
 #define MISO_PIN 19
 #define MOSI_PIN 23
 
-// --- Timing ---
+// ===================================================================
+// ==                      Timing                                  ==
+// ===================================================================
 unsigned long previousSampleTime = 0;
-const long    sampleInterval     = 4;       // 250 Hz
+const long    sampleInterval     = 4;
 unsigned long previousPrintTime  = 0;
-const long    printInterval      = 1000;    // flush to SD every 1 s
+const long    printInterval      = 1000;
+unsigned long previousStatusTime = 0;
+const long    statusInterval     = 2000;
 
-// --- GPS Timing ---
+// ===================================================================
+// ==                   GPS / Motion                               ==
+// ===================================================================
 const unsigned long gpsDebounceDelay = 10000;
-const unsigned long gpsStaleTimeout  = 300000;
-
-// --- Motion Detection ---
-float smoothedAccelMag      = 1.0;
+float smoothedAccelMag  = 1.0;
 const float motionThreshold = 0.08;
 
-// --- Objects ---
+// ===================================================================
+// ==   GPS millisecond anchor — used to get true sub-second time  ==
+// ==                                                              ==
+// == The GPS NMEA sentence arrives at 1Hz. When the GPS second    ==
+// == ticks over (i.e. gps.time.second() changes), we record the  ==
+// == current millis() value. From then on, each sample's time_ms  ==
+// == = GPS_wall_clock_ms + (millis() - gpsSecondAnchorMillis).   ==
+// == This anchors sub-second precision to the system clock while  ==
+// == keeping the HH:MM:SS part accurate to GPS UTC.              ==
+// ===================================================================
+uint32_t      gpsWallClockMs       = 0;  // GPS time in ms at last second tick
+unsigned long gpsSecondAnchorMs    = 0;  // millis() at that moment
+uint8_t       lastGpsSecond        = 255; // sentinel — forces update on first fix
+
+// ===================================================================
+// ==                      Objects                                 ==
+// ===================================================================
 TinyGPSPlus      gps;
 File             dataFile;
 Adafruit_MPU6050 mpu;
 Madgwick         filter;
 
-// --- State Flags ---
-bool          gpsIsConnected   = false;
+// ===================================================================
+// ==                       State                                  ==
+// ===================================================================
+bool          gpsLocationValid = false;
 bool          sdCardIsWorking  = true;
-bool          wifiIsConnected  = true;
 unsigned long gpsLossTimestamp = 0;
 bool          isMoving         = false;
 
-// --- GPS stale tracking ---
-double        lastLat = 0.0, lastLon = 0.0;
-unsigned long lastLocationTime = 0;
-bool          staleNoticeSent  = false;
-
-// --- Orientation ---
 float roll = 0, pitch = 0, yaw = 0;
-
-// --- Sensor data ---
 float accelX = 0, accelY = 0, accelZ = 0;
-
-// --- Gyro offsets ---
 float gyro_x_offset = 0, gyro_y_offset = 0, gyro_z_offset = 0;
 
-// ===================================================================
-// ==                    1-SECOND SAMPLE BUFFER                     ==
-// ===================================================================
-// The fast loop runs at 250 Hz, producing ~250 samples per second.
-// Rather than discarding 249 of them, each sample is written into
-// this buffer. When the 1-second slow loop fires, the entire buffer
-// is flushed to the SD card in one open/write/close cycle, then
-// cleared ready for the next second.
-//
-// Memory: 250 samples x 104 bytes = ~25 KB — well within budget.
-// ===================================================================
-
-const int BUFFER_SIZE = 260;   // slight headroom above 250
-const int LINE_LEN    = 104;   // max chars per line incl. '\n'
-
-char          sampleBuffer[BUFFER_SIZE][LINE_LEN];
-int           bufferIndex = 0;
-
-// --- Function Prototypes ---
-void   calibrate_gyro();
-void   sendIFTTTNotification(String event);
-void   connectToWifi();
-String getFormattedTime();
+unsigned long rowsLogged = 0;
 
 // ===================================================================
+// ==                  250 Hz SAMPLE BUFFER                        ==
+// ===================================================================
+const int  BUFFER_SIZE = 260;
+DataRecord sampleBuffer[BUFFER_SIZE];
+int        bufferIndex = 0;
 
+// ===================================================================
+// ==                      Prototypes                              ==
+// ===================================================================
+void     calibrate_gyro();
+uint32_t getTimeMs();
+String   getFormattedTime();
+void     buildRecord(DataRecord& rec);
+void     writeFileHeader(File& f);
+void     setupBLE();
+void     bleSendString(const char* str);
+bool     readExact(File& f, uint8_t* buf, uint32_t n);
+void     runDump();
+void     sendBLEStatus();
+
+// ===================================================================
+// ==                         SETUP                                ==
+// ===================================================================
 void setup() {
-
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   delay(100);
@@ -114,64 +233,132 @@ void setup() {
   Serial.begin(9600);
   Wire.begin();
 
-  if (!mpu.begin()) {
-    while (1);
-  }
-
+  if (!mpu.begin()) { while (1); }
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
 
   calibrate_gyro();
-
   filter.begin(250);
+  filter.beta(0.02);  // less accelerometer correction
 
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SD_CS);
-
   if (!SD.begin(SD_CS)) {
     sdCardIsWorking = false;
+    Serial.println("SD card failed to initialise");
   }
 
-  connectToWifi();
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
-  sendIFTTTNotification(event_power_on);
-
-  if (!sdCardIsWorking) {
-    sendIFTTTNotification(event_sd_card_failed);
-  }
+  setupBLE();
+  Serial.println("ESP32 Sensor Logger v1.1.2");
+  Serial.println("Setup complete. Advertising — waiting for connection.");
 }
 
 // ===================================================================
+// ==                        MAIN LOOP                             ==
+// ===================================================================
 
 void loop() {
-
   unsigned long currentTime = millis();
 
-  // --- WiFi check (unchanged) ---
-  if (WiFi.status() != WL_CONNECTED) {
+  if (statusRequestedOnConnect && bleConnected) {
+    statusRequestedOnConnect = false;
+    delay(50);
+    sendBLEStatus();
+    if      (logState == LOGGING_ON)     bleSendString("##LOG_STARTED##");
+    else if (logState == LOGGING_PAUSED) bleSendString("##LOG_PAUSED##");
+    else                                 bleSendString("##LOG_STOPPED##");
+  }
 
-    if (wifiIsConnected) {
-      wifiIsConnected = false;
-    }
-    connectToWifi();
-
-  } else {
-
-    if (!wifiIsConnected) {
-      wifiIsConnected = true;
-      sendIFTTTNotification(event_wifi_reconnected);
+  if (dumpRequested) {
+    dumpRequested = false;
+    if (logState == LOGGING_OFF) {
+      runDump();
+      if (bleConnected) sendBLEStatus();
+    } else {
+      bleSendString("##ERROR:Stop logging before downloading##");
     }
   }
 
-  // ===== FAST LOOP — 250 Hz =====
-  if (currentTime - previousSampleTime >= sampleInterval) {
+  if (startRequested) {
+    startRequested = false;
+    if (logState != LOGGING_ON) {
+      logState = LOGGING_ON;
+      bleSendString("##LOG_STARTED##");
+      Serial.println("Logging STARTED");
+    }
+  }
 
-    float dt = (currentTime - previousSampleTime) / 1000.0;
+  if (pauseRequested) {
+    pauseRequested = false;
+    if (logState == LOGGING_ON) {
+      logState = LOGGING_PAUSED;
+      bleSendString("##LOG_PAUSED##");
+      Serial.println("Logging PAUSED");
+    }
+  }
+
+  if (stopRequested) {
+    stopRequested = false;
+    if (logState != LOGGING_OFF) {
+      if (bufferIndex > 0 && sdCardIsWorking) {
+        dataFile = SD.open("/data.bin", FILE_APPEND);
+        if (dataFile) {
+          if (dataFile.size() == 0) writeFileHeader(dataFile);
+          dataFile.write((uint8_t*)sampleBuffer, bufferIndex * RECORD_SIZE);
+          rowsLogged += bufferIndex;
+          dataFile.close();
+        }
+        bufferIndex = 0;
+      }
+      logState = LOGGING_OFF;
+      bleSendString("##LOG_STOPPED##");
+      Serial.println("Logging STOPPED");
+      delay(20);
+      sendBLEStatus();
+    }
+  }
+
+  if (clearRequested) {
+    clearRequested = false;
+    if (logState != LOGGING_OFF) {
+      logState    = LOGGING_OFF;
+      bufferIndex = 0;
+    }
+    File f = SD.open("/data.bin", FILE_WRITE);
+    if (f) {
+      f.close();
+      rowsLogged = 0;
+      bleSendString("##CLEARED##");
+      Serial.println("data.bin cleared");
+      delay(20);
+      sendBLEStatus();
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // FAST LOOP — 250 Hz
+  // -------------------------------------------------------------------
+  if (currentTime - previousSampleTime >= sampleInterval) {
     previousSampleTime = currentTime;
 
-    while (Serial.available() > 0) {
-      gps.encode(Serial.read());
+    while (Serial.available() > 0) gps.encode(Serial.read());
+
+    // -------------------------------------------------------------------
+    // GPS millisecond anchor update
+    // When the GPS second ticks over, record millis() as our anchor so
+    // every subsequent sample can compute: GPS_ms + (millis() - anchor)
+    // This gives true sub-second precision without relying on centisecond.
+    // -------------------------------------------------------------------
+    if (gps.time.isValid()) {
+      uint8_t currentGpsSec = gps.time.second();
+      if (currentGpsSec != lastGpsSecond) {
+        // New GPS second has arrived — update anchor
+        gpsWallClockMs    = (uint32_t)gps.time.hour()   * 3600000UL
+                          + (uint32_t)gps.time.minute()  * 60000UL
+                          + (uint32_t)gps.time.second()  * 1000UL;
+        gpsSecondAnchorMs = millis();
+        lastGpsSecond     = currentGpsSec;
+      }
     }
 
     sensors_event_t a, g, temp;
@@ -185,41 +372,31 @@ void loop() {
     float gyroY = (g.gyro.y - gyro_y_offset) * 180.0 / PI;
     float gyroZ = (g.gyro.z - gyro_z_offset) * 180.0 / PI;
 
-    float currentAccelMag = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ) / 9.81;
+    float currentAccelMag = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ) / 9.81;
     smoothedAccelMag = (smoothedAccelMag * 0.95) + (currentAccelMag * 0.05);
     isMoving = (abs(smoothedAccelMag - 1.0) > motionThreshold);
 
-    // GPS connection status (unchanged)
-    if (gps.satellites.value() >= 4) {
-
-      if (!gpsIsConnected) {
-        gpsIsConnected   = true;
+    if (gps.location.isValid() && gps.satellites.value() >= 4) {
+      if (!gpsLocationValid) {
+        gpsLocationValid = true;
         gpsLossTimestamp = 0;
-        sendIFTTTNotification(event_gps_connected);
+        Serial.println("GPS location fix acquired");
       }
-
     } else {
-
-      if (gpsIsConnected) {
-        if (isMoving) {
-          gpsLossTimestamp = currentTime;
-        }
-        gpsIsConnected = false;
+      if (gpsLocationValid) {
+        if (isMoving) gpsLossTimestamp = currentTime;
+        gpsLocationValid = false;
       }
     }
-
     if (gpsLossTimestamp > 0 && (currentTime - gpsLossTimestamp > gpsDebounceDelay)) {
-      sendIFTTTNotification(event_gps_lost);
       gpsLossTimestamp = 0;
     }
 
-    // Madgwick filter (unchanged)
     filter.updateIMU(gyroX, gyroY, gyroZ, accelX, accelY, accelZ);
     roll  = filter.getRoll();
     pitch = filter.getPitch();
     yaw   = filter.getYaw();
 
-    // GPS yaw correction (unchanged)
     if (gps.speed.kmph() > 5.0 && gps.course.isValid()) {
       float gpsYaw = gps.course.deg();
       float error  = gpsYaw - yaw;
@@ -230,139 +407,309 @@ void loop() {
       if (yaw >= 360) yaw -= 360;
     }
 
-    // --- Store this sample in the buffer ---
-    if (bufferIndex < BUFFER_SIZE) {
-
-      char gpsPart[32];
-      if (gps.location.isValid()) {
-        snprintf(gpsPart, sizeof(gpsPart), "%.6f, %.6f",
-                 gps.location.lat(), gps.location.lng());
-      } else {
-        snprintf(gpsPart, sizeof(gpsPart), "Invalid");
-      }
-
-      snprintf(sampleBuffer[bufferIndex], LINE_LEN,
-        "Time: %s | GPS: %s | Accel: %.4f, %.4f, %.4f | Roll: %.2f | Pitch: %.2f | Yaw: %.2f\n",
-        getFormattedTime().c_str(),
-        gpsPart,
-        accelX, accelY, accelZ,
-        roll, pitch, yaw);
-
+    if (logState == LOGGING_ON && bufferIndex < BUFFER_SIZE) {
+      buildRecord(sampleBuffer[bufferIndex]);
       bufferIndex++;
     }
   }
 
-  // ===== SLOW LOOP — flush to SD every 1 s =====
+  // -------------------------------------------------------------------
+  // SLOW LOOP — 1 Hz
+  // -------------------------------------------------------------------
   if (currentTime - previousPrintTime >= printInterval) {
-
     previousPrintTime = currentTime;
 
-    // Serial print (unchanged — last sample values)
     Serial.print("Time: "); Serial.print(getFormattedTime());
     Serial.print(" | GPS: ");
-    if (gps.location.isValid()) {
-      Serial.print(gps.location.lat(), 6); Serial.print(", ");
+    if (gpsLocationValid) {
+      Serial.print(gps.location.lat(), 6);
+      Serial.print(", ");
       Serial.print(gps.location.lng(), 6);
-    } else {
-      Serial.print("Invalid");
-    }
+    } else { Serial.print("No fix"); }
     Serial.print(" | Accel: ");
     Serial.print(accelX, 4); Serial.print(", ");
     Serial.print(accelY, 4); Serial.print(", ");
     Serial.print(accelZ, 4);
-    Serial.print(" | Roll: "); Serial.print(roll, 2);
+    Serial.print(" | Roll: ");  Serial.print(roll, 2);
     Serial.print(" | Pitch: "); Serial.print(pitch, 2);
-    Serial.print(" | Yaw: "); Serial.println(yaw, 2);
+    Serial.print(" | Yaw: ");   Serial.print(yaw, 2);
+    Serial.print(" | BLE: "); Serial.print(bleConnected ? "connected" : "advertising");
+    Serial.print(" | State: ");
+    Serial.println(logState == LOGGING_ON ? "LOGGING" :
+                   logState == LOGGING_PAUSED ? "PAUSED" : "OFF");
 
-    // Flush all buffered samples to SD
-    dataFile = SD.open("/data.txt", FILE_APPEND);
-
-    if (dataFile) {
-
-      if (!sdCardIsWorking) {
-        sendIFTTTNotification(event_sd_card_reconnected);
+    if (logState == LOGGING_ON) {
+      dataFile = SD.open("/data.bin", FILE_APPEND);
+      if (dataFile) {
+        if (dataFile.size() == 0) writeFileHeader(dataFile);
+        sdCardIsWorking = true;
+        dataFile.write((uint8_t*)sampleBuffer, bufferIndex * RECORD_SIZE);
+        rowsLogged += bufferIndex;
+        dataFile.close();
+      } else {
+        sdCardIsWorking = false;
+        Serial.println("SD write failed");
       }
-      sdCardIsWorking = true;
-
-      for (int i = 0; i < bufferIndex; i++) {
-        dataFile.print(sampleBuffer[i]);
-      }
-      dataFile.close();
-
-    } else {
-
-      if (sdCardIsWorking) {
-        sendIFTTTNotification(event_sd_card_failed);
-      }
-      sdCardIsWorking = false;
+      bufferIndex = 0;
     }
+  }
 
-    // Clear the buffer for the next second
-    bufferIndex = 0;
+  if (bleConnected && (currentTime - previousStatusTime >= statusInterval)) {
+    previousStatusTime = currentTime;
+    sendBLEStatus();
   }
 }
 
 // ===================================================================
-// ==                       HELPER FUNCTIONS                        ==
+// ==   getTimeMs — true millisecond timestamp                     ==
+// ==                                                              ==
+// == If GPS is valid and we have an anchor: GPS wall-clock second ==
+// == + millis() offset since that second ticked. This gives true  ==
+// == sub-second precision anchored to GPS UTC.                    ==
+// ==                                                              ==
+// == If no GPS: millis() % 86400000 as relative fallback.        ==
 // ===================================================================
-
-void connectToWifi() {
-
-  if (WiFi.status() == WL_CONNECTED) return;
-
-  digitalWrite(LED_PIN, HIGH);
-  WiFi.begin(ssid, password);
-
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
-    delay(500);
-    retries++;
+uint32_t getTimeMs() {
+  if (gps.time.isValid() && lastGpsSecond != 255) {
+    // How many ms have elapsed since the GPS second ticked over?
+    unsigned long elapsed = millis() - gpsSecondAnchorMs;
+    // Cap at 999ms to stay within the current second
+    if (elapsed > 999) elapsed = 999;
+    return gpsWallClockMs + (uint32_t)elapsed;
   }
-
-  digitalWrite(LED_PIN, LOW);
+  return (uint32_t)(millis() % 86400000UL);
 }
 
-void sendIFTTTNotification(String event) {
+// Human-readable time for Serial monitor
+String getFormattedTime() {
+  if (gps.time.isValid()) {
+    uint32_t ms = getTimeMs();
+    uint32_t h  = ms / 3600000; ms %= 3600000;
+    uint32_t m  = ms / 60000;   ms %= 60000;
+    uint32_t s  = ms / 1000;    ms %= 1000;
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu.%03lu", h, m, s, ms);
+    return String(buf);
+  }
+  unsigned long total = millis() / 1000;
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+           total / 3600, (total % 3600) / 60, total % 60);
+  return String(buf);
+}
 
-  if (WiFi.status() != WL_CONNECTED) return;
+// ===================================================================
+// ==   readExact — read exactly n bytes with retry on sector stall ==
+// ===================================================================
+bool readExact(File& f, uint8_t* buf, uint32_t n) {
+  uint32_t got     = 0;
+  int      retries = 0;
+  while (got < n) {
+    if (f.position() >= f.size()) return false;
+    int r = f.read(buf + got, (int)(n - got));
+    if (r > 0) {
+      got    += r;
+      retries = 0;
+    } else {
+      retries++;
+      if (retries > 50) {
+        Serial.print("readExact: gave up at pos "); Serial.println(f.position());
+        return false;
+      }
+      delay(2);
+    }
+  }
+  return true;
+}
 
-  HTTPClient http;
-  String url = "http://maker.ifttt.com/trigger/" + event + "/with/key/" + ifttt_key;
-  http.begin(url);
-  http.GET();
-  http.end();
+// ===================================================================
+// ==           BLOCKING DUMP                                      ==
+// ===================================================================
+void runDump() {
+  if (!sdCardIsWorking) { bleSendString("##ERROR:SD not available##"); return; }
+
+  dumpFile = SD.open("/data.bin", FILE_READ);
+  if (!dumpFile) { bleSendString("##ERROR:data.bin missing##"); return; }
+
+  uint32_t fileSize = dumpFile.size();
+  Serial.print("File size: "); Serial.println(fileSize);
+
+  if (fileSize <= 4) {
+    bleSendString("##ERROR:data.bin empty##");
+    dumpFile.close(); return;
+  }
+
+  dumpFile.seek(4);
+  uint32_t dataBytes    = fileSize - 4;
+  uint32_t totalRecords = dataBytes / RECORD_SIZE;
+
+  if (totalRecords == 0) {
+    bleSendString("##ERROR:No complete records##");
+    dumpFile.close(); return;
+  }
+
+  char startMsg[64];
+  snprintf(startMsg, sizeof(startMsg), "##START,%lu,BIN##", (unsigned long)fileSize);
+  bleSendString(startMsg);
+  delay(20);
+
+  Serial.print("Dump started — "); Serial.print(totalRecords);
+  Serial.print(" records ("); Serial.print(dataBytes); Serial.println(" bytes)");
+
+  cancelDumpRequested = false;
+  uint32_t      sent      = 0;
+  unsigned long lastPrint = millis();
+  unsigned long startTime = millis();
+  uint8_t       record[RECORD_SIZE];
+
+  for (uint32_t i = 0; i < totalRecords && bleConnected && !cancelDumpRequested; i++) {
+    if (!readExact(dumpFile, record, RECORD_SIZE)) {
+      Serial.print("readExact failed at record "); Serial.println(i);
+      break;
+    }
+    if (record[0] != SYNC_BYTE) {
+      Serial.print("Bad sync at record "); Serial.println(i);
+      dumpFile.seek(dumpFile.position() - RECORD_SIZE + 1);
+      i--; continue;
+    }
+    pNotifyChar->setValue(record, RECORD_SIZE);
+    pNotifyChar->notify();
+    sent++;
+    delay(2);
+
+    if (millis() - lastPrint >= 2000) {
+      lastPrint = millis();
+      Serial.print("Dump: "); Serial.print(sent);
+      Serial.print(" / "); Serial.print(totalRecords);
+      Serial.print(" ("); Serial.print((sent * 100) / totalRecords); Serial.println("%)");
+    }
+  }
+
+  dumpFile.close();
+
+  if (cancelDumpRequested) {
+    cancelDumpRequested = false;
+    if (bleConnected) bleSendString("##CANCELLED##");
+    Serial.println("Dump cancelled"); return;
+  }
+  if (!bleConnected) { Serial.println("Dump aborted — disconnected"); return; }
+
+  float elapsed = (millis() - startTime) / 1000.0;
+  float kbps    = (sent * RECORD_SIZE / 1024.0) / elapsed;
+  Serial.print("Dump complete — "); Serial.print(sent);
+  Serial.print(" / "); Serial.print(totalRecords);
+  Serial.print(" records, "); Serial.print(elapsed, 1);
+  Serial.print("s @ "); Serial.print(kbps, 1); Serial.println(" KB/s");
+
+  delay(30);
+  bleSendString("##END##");
+}
+
+// ===================================================================
+// ==               Build one binary record                        ==
+// ===================================================================
+void buildRecord(DataRecord& rec) {
+  rec.sync    = SYNC_BYTE;
+  rec.time_ms = getTimeMs();
+
+  if (gpsLocationValid) {
+    rec.gps_valid = 1;
+    rec.lat_e6    = (int32_t)round(gps.location.lat() * 1000000.0);
+    rec.lon_e6    = (int32_t)round(gps.location.lng() * 1000000.0);
+  } else {
+    rec.gps_valid = 0;
+    rec.lat_e6    = 0;
+    rec.lon_e6    = 0;
+  }
+
+  rec.accelX = accelX;
+  rec.accelY = accelY;
+  rec.accelZ = accelZ;
+  rec.roll   = roll;
+  rec.pitch  = pitch;
+  rec.yaw    = yaw;
+}
+
+// ===================================================================
+// ==               Write 4-byte file header                       ==
+// ===================================================================
+void writeFileHeader(File& f) {
+  const uint8_t hdr[4] = {FILE_MAGIC_0, FILE_MAGIC_1, FILE_MAGIC_2, FILE_MAGIC_3};
+  f.write(hdr, 4);
+}
+
+// ===================================================================
+// ==                   BLE STATUS BROADCAST                       ==
+// ===================================================================
+void sendBLEStatus() {
+  if (!sdCardIsWorking) {
+    if (SD.begin(SD_CS)) { sdCardIsWorking = true; Serial.println("SD card recovered"); }
+  }
+  uint32_t fileSize = 0;
+  if (sdCardIsWorking) {
+    File f = SD.open("/data.bin", FILE_READ);
+    if (f) { fileSize = f.size(); f.close(); }
+  }
+  const char* stateStr =
+    logState == LOGGING_ON     ? "LOGGING" :
+    logState == LOGGING_PAUSED ? "PAUSED"  : "OFF";
+  char buf[96];
+  snprintf(buf, sizeof(buf), "STATUS,%s,%s,%s,%lu,%lu",
+    stateStr,
+    gpsLocationValid ? "GPS_OK"  : "GPS_NO_FIX",
+    sdCardIsWorking  ? "SD_OK"   : "SD_FAIL",
+    (unsigned long)fileSize,
+    (unsigned long)rowsLogged);
+  bleSendString(buf);
+}
+
+// ===================================================================
+// ==                    HELPER FUNCTIONS                          ==
+// ===================================================================
+void bleSendString(const char* str) {
+  if (!bleConnected || !pNotifyChar) return;
+  pNotifyChar->setValue((uint8_t*)str, strlen(str));
+  pNotifyChar->notify();
+}
+
+void setupBLE() {
+  BLEDevice::setMTU(512);
+  BLEDevice::init(BLE_DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  pNotifyChar = pService->createCharacteristic(
+    NOTIFY_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pNotifyChar->addDescriptor(new BLE2902());
+  pWriteChar = pService->createCharacteristic(
+    WRITE_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pWriteChar->setCallbacks(new WriteCallbacks());
+  pService->start();
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(false);
+  adv->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising started");
 }
 
 void calibrate_gyro() {
-
   long cal_start = millis();
   while (millis() - cal_start < 4000) {
     digitalWrite(LED_PIN, HIGH); delay(50);
     digitalWrite(LED_PIN, LOW);  delay(50);
   }
-
-  const int num_readings = 1000;
+  const int N = 1000;
   sensors_event_t a, g, temp;
-
-  for (int i = 0; i < num_readings; i++) {
+  for (int i = 0; i < N; i++) {
     mpu.getEvent(&a, &g, &temp);
     gyro_x_offset += g.gyro.x;
     gyro_y_offset += g.gyro.y;
     gyro_z_offset += g.gyro.z;
     delay(3);
   }
-
-  gyro_x_offset /= num_readings;
-  gyro_y_offset /= num_readings;
-  gyro_z_offset /= num_readings;
-}
-
-String getFormattedTime() {
-
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "Time not synced";
-
-  char timeString[20];
-  strftime(timeString, sizeof(timeString), "%H:%M:%S", &timeinfo);
-  return String(timeString);
+  gyro_x_offset /= N;
+  gyro_y_offset /= N;
+  gyro_z_offset /= N;
 }
