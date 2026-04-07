@@ -3,6 +3,7 @@ import numpy as np
 from datetime import datetime
 import os
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from text_to_excel import process_data_file
 
 # ===================================================================
@@ -11,58 +12,37 @@ from text_to_excel import process_data_file
 SMALL_CRASH_THRESHOLD = 1 * 9.81
 LARGE_CRASH_THRESHOLD = 1 * 9.81
 COOLDOWN_TIME         = 2.0
-
-# ===================================================================
-# Smoothing window for the acceleration crash-detection plot.
-# Set to 1 to disable. At 250 Hz: window 25 = 100 ms.
-# ===================================================================
-SMOOTHING_WINDOW = 20
+SMOOTHING_WINDOW      = 20
 
 # ===================================================================
 # Velocity integration settings
 #
-# FORWARD_AXIS:
-#   Which normalised sensor axis points forward along the bike.
-#   Integrated directly — positive = accelerating, negative = braking.
-#   Flip sign ('-y') if the plot shows braking as positive.
-#   Options: 'x', '-x', 'y', '-y'
+# FORWARD_AXIS        : sensor axis pointing forward. 'y' / '-y' / 'x' / '-x'
+# VELOCITY_SMOOTHING_WINDOW : rolling mean before integration (samples)
+# GRAVITY_CALIBRATION_SECONDS : idle window at run start for bias measurement
+# STATIONARY_THRESHOLD : velocity (m/s) below which bike is considered stopped
+#                        (applied only once bike has been moving)
+# STATIONARY_HOLD_SAMPLES : retained for compatibility
+# ROLL_THRESHOLD_DEG  : max |roll| for rotation-matrix gravity removal;
+#                       outside this range only bias correction is used
+#                       (filter convergence guard)
+# GAP_THRESHOLD_S     : time gap between records that marks a new test run
 #
-# VELOCITY_SMOOTHING_WINDOW:
-#   Rolling mean applied to the forward acceleration before integrating.
-#   Also used for the top panel acceleration plot.
-#   At 250 Hz: 25 = 100 ms. Set to 1 to disable.
-#
-# GRAVITY_CALIBRATION_SECONDS:
-#   Duration of stationary idle at the very start of the FIRST run used
-#   to measure the true gravity vector magnitude from the sensor itself.
-#   The MPU6050 has a ~1 m/s² z-axis hardware offset (reads ~10.81 when
-#   gravity is 9.81). Using the measured magnitude instead of 9.81 means
-#   the rotation matrix removes exactly the right amount of gravity from
-#   each axis, giving near-zero residuals at idle.
-#   Must be <= the idle time before the first movement in the data.
-#
-# STATIONARY_THRESHOLD:
-#   If |forward acceleration| stays below this (m/s²) for at least
-#   STATIONARY_HOLD_SAMPLES consecutive samples, velocity is clamped
-#   to zero to prevent post-braking drift.
-#
-# STATIONARY_HOLD_SAMPLES:
-#   Minimum consecutive low-acceleration samples to trigger zero-clamp.
-#   At 250 Hz, 200 = 800 ms.
-#
-# GAP_THRESHOLD_S:
-#   Time gap (seconds) between consecutive records marking a new run.
+# CRUISE_TOLERANCE    : fraction of peak velocity within which the bike is
+#                       considered to be cruising at sustained speed.
+#                       e.g. 0.05 means ±5 % of peak counts as cruise.
 # ===================================================================
 FORWARD_AXIS                 = 'y'
 VELOCITY_SMOOTHING_WINDOW    = 25
 GRAVITY_CALIBRATION_SECONDS  = 2.0
 STATIONARY_THRESHOLD         = 1
 STATIONARY_HOLD_SAMPLES      = 1
+ROLL_THRESHOLD_DEG           = 5.0
 GAP_THRESHOLD_S              = 10.0
+CRUISE_TOLERANCE             = 0.05   # fraction of peak velocity
 
 
 def parse_time_to_seconds(df):
-    """Convert HH:MM:SS.mmm to absolute seconds since midnight."""
     parsed = (
         pd.to_datetime(df['Time'], format='%H:%M:%S.%f', errors='coerce')
         .fillna(pd.to_datetime(df['Time'], format='%H:%M:%S', errors='coerce'))
@@ -75,128 +55,73 @@ def parse_time_to_seconds(df):
 
 
 def measure_sensor_bias(df, calibration_seconds):
-    """
-    Measure the per-axis sensor bias from the stationary idle period at
-    the start of the data.
-
-    Why bias subtraction is the correct approach (not a rotation matrix):
-
-    The MPU6050 has hardware offsets on all three axes. More importantly,
-    the rotation matrix cannot project gravity onto an axis that is the
-    rotation axis itself:
-      - Pitch is rotation AROUND Y, so gravity can never have a Y component
-        from pitch. The Y idle reading (here ~0.106 m/s²) is pure hardware
-        bias, not gravity.
-      - Roll is rotation AROUND X, so gravity can never have an X component
-        from roll. The X idle reading (~-0.272 m/s²) is also pure hardware
-        bias.
-      - Z has a ~1 m/s² hardware offset (reads ~10.81 instead of 9.81).
-
-    The correct removal for a bike on flat ground:
-      When the bike is stationary, accel_raw = sensor_bias (true accel = 0).
-      Subtracting the idle mean from every raw reading removes both hardware
-      offsets and any gravity contribution from the sensor's resting lean
-      angle, giving accel_norm ≈ 0 at idle and the true dynamic acceleration
-      during motion.
-
-    This is more accurate than the rotation matrix approach for this sensor
-    because it is measured empirically rather than derived from potentially
-    drifted Madgwick angles.
-
-    Returns dict of per-axis bias values for diagnostic printing.
-    """
     times      = df['Time_sec'].values
     t0         = times[0]
     idle_mask  = times <= (t0 + calibration_seconds)
     idle_count = idle_mask.sum()
 
     if idle_count < 10:
-        print(f"Warning: only {idle_count} idle samples in first "
-              f"{calibration_seconds}s — using zero bias.")
+        print(f"Warning: only {idle_count} idle samples — using zero bias.")
         return {'x': 0.0, 'y': 0.0, 'z': 0.0, 'n': 0}
 
     x_bias = df.loc[idle_mask, 'x-axis'].mean()
     y_bias = df.loc[idle_mask, 'y-axis'].mean()
     z_bias = df.loc[idle_mask, 'z-axis'].mean()
 
-    print(f"Sensor bias from {idle_count} idle samples:")
-    print(f"  x: {x_bias:+.4f} m/s²  "
-          f"y: {y_bias:+.4f} m/s²  "
-          f"z: {z_bias:+.4f} m/s²  "
-          f"(z hardware offset vs 9.81: {z_bias - 9.81:+.4f} m/s²)")
-
+    print(f"Sensor bias ({idle_count} idle samples): "
+          f"x={x_bias:+.4f}  y={y_bias:+.4f}  z={z_bias:+.4f} m/s²"
+          f"  (z offset: {z_bias - 9.81:+.4f} m/s²)")
     return {'x': x_bias, 'y': y_bias, 'z': z_bias, 'n': int(idle_count)}
 
 
 def normalize_acceleration(df, bias, roll_threshold_deg=5.0):
-    """
-    Remove hardware bias and gravity using rotation matrix,
-    but only if the roll angle is small (to avoid bad Madgwick drift).
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Must contain 'x-axis', 'y-axis', 'z-axis', 'Roll', 'Pitch', 'Yaw'
-    bias : dict
-        {'x': x_bias, 'y': y_bias, 'z': z_bias} from idle measurement
-    roll_threshold_deg : float
-        Maximum absolute roll to apply rotation-based normalization
-    """
-
-    # Convert angles to radians
     roll  = np.radians(df['Roll'].values)
     pitch = np.radians(df['Pitch'].values)
     yaw   = np.radians(df['Yaw'].values)
 
-    # Subtract hardware bias first
     raw_x = df['x-axis'].values - bias['x']
     raw_y = df['y-axis'].values - bias['y']
     raw_z = df['z-axis'].values - bias['z']
 
-    # Allocate arrays
     x_norm = np.zeros_like(roll)
     y_norm = np.zeros_like(roll)
     z_norm = np.zeros_like(roll)
 
-    gravity_global = np.array([0.0, 0.0, 9.81])
+    gravity_global  = np.array([0.0, 0.0, 9.81])
     roll_thresh_rad = np.radians(roll_threshold_deg)
 
     for i in range(len(roll)):
         if abs(roll[i]) < roll_thresh_rad:
-            # Rotation matrices
             R_x = np.array([
-                [1, 0, 0],
+                [1, 0,               0             ],
                 [0, np.cos(roll[i]), -np.sin(roll[i])],
                 [0, np.sin(roll[i]),  np.cos(roll[i])]
             ])
             R_y = np.array([
                 [ np.cos(pitch[i]), 0, np.sin(pitch[i])],
-                [0, 1, 0],
+                [0,                 1, 0               ],
                 [-np.sin(pitch[i]), 0, np.cos(pitch[i])]
             ])
             R_z = np.array([
                 [np.cos(yaw[i]), -np.sin(yaw[i]), 0],
                 [np.sin(yaw[i]),  np.cos(yaw[i]), 0],
-                [0, 0, 1]
+                [0,               0,              1]
             ])
-            R = R_z @ R_y @ R_x
+            R             = R_z @ R_y @ R_x
             gravity_local = R.T @ gravity_global
-            accel_local = np.array([raw_x[i], raw_y[i], raw_z[i]])
-            accel_normalized = accel_local - gravity_local
+            accel_norm    = np.array([raw_x[i], raw_y[i], raw_z[i]]) - gravity_local
         else:
-            # If roll is too big, just keep bias-corrected acceleration
-            accel_normalized = np.array([raw_x[i], raw_y[i], raw_z[i]])
+            accel_norm = np.array([raw_x[i], raw_y[i], raw_z[i]])
 
-        x_norm[i], y_norm[i], z_norm[i] = accel_normalized
+        x_norm[i], y_norm[i], z_norm[i] = accel_norm
 
     df['x-axis_norm'] = x_norm
     df['y-axis_norm'] = y_norm
     df['z-axis_norm'] = z_norm
-
     return df
 
+
 def smooth_acceleration(df, window):
-    """Compute raw and smoothed 3D acceleration magnitude for crash detection."""
     df['accel_magnitude'] = np.sqrt(
         df['x-axis_norm']**2 +
         df['y-axis_norm']**2 +
@@ -211,7 +136,6 @@ def smooth_acceleration(df, window):
 
 
 def split_into_runs(df, gap_threshold_s):
-    """Split on gaps > gap_threshold_s seconds. Returns list of dataframes."""
     times         = df['Time_sec'].values
     split_indices = [0]
     for i in range(1, len(times)):
@@ -226,17 +150,10 @@ def split_into_runs(df, gap_threshold_s):
 
 
 def integrate_velocity_for_run(run, forward_axis, smoothing_window,
-                               stationary_threshold=None, stationary_hold=None,
-                               velocity_threshold=None):
-    """
-    Integrate forward axis after smoothing.
-    Once velocity exceeds velocity_threshold (or stationary_threshold if None),
-    any subsequent velocity below threshold is clamped to zero permanently.
-
-    Accepts old arguments for backward compatibility.
-    """
-    # Use velocity_threshold if given, else fallback to stationary_threshold
-    threshold = velocity_threshold if velocity_threshold is not None else stationary_threshold
+                                stationary_threshold=None, stationary_hold=None,
+                                velocity_threshold=None):
+    threshold = velocity_threshold if velocity_threshold is not None \
+                else stationary_threshold
     if threshold is None:
         raise ValueError("No velocity threshold provided")
 
@@ -249,7 +166,6 @@ def integrate_velocity_for_run(run, forward_axis, smoothing_window,
     if forward_axis not in axis_map:
         raise ValueError(f"FORWARD_AXIS must be one of {list(axis_map.keys())}")
 
-    # Smooth forward acceleration
     forward_accel  = axis_map[forward_axis]
     forward_smooth = pd.Series(forward_accel).rolling(
         window=smoothing_window, min_periods=1, center=True
@@ -258,19 +174,18 @@ def integrate_velocity_for_run(run, forward_axis, smoothing_window,
     times_abs = run['Time_sec'].values
     times_rel = times_abs - times_abs[0]
 
-    # Trapezoid integration
     velocity = np.zeros(len(times_rel))
-    moving = False  # flag set once velocity exceeds threshold
+    moving   = False
 
     for i in range(1, len(times_rel)):
-        dt = times_rel[i] - times_rel[i - 1]
-        velocity[i] = velocity[i - 1] + 0.5 * (forward_smooth[i] + forward_smooth[i - 1]) * dt
+        dt          = times_rel[i] - times_rel[i - 1]
+        velocity[i] = (velocity[i - 1]
+                       + 0.5 * (forward_smooth[i] + forward_smooth[i - 1]) * dt)
 
         if not moving and abs(velocity[i]) > threshold:
-            moving = True  # bike has started moving
-
+            moving = True
         if moving and abs(velocity[i]) < threshold:
-            velocity[i] = 0.0  # permanent clamp after moving
+            velocity[i] = 0.0
 
     run = run.copy()
     run['Time_rel']         = times_rel
@@ -280,7 +195,6 @@ def integrate_velocity_for_run(run, forward_axis, smoothing_window,
 
 
 def detect_crashes(df, small_threshold, large_threshold, cooldown_time):
-    """Crash detection on the smoothed 3D acceleration magnitude."""
     small_crashes         = []
     large_crashes         = []
     last_small_crash_time = -cooldown_time
@@ -321,9 +235,75 @@ def plot_acceleration_data(df, small_threshold, large_threshold, window):
     plt.show()
 
 
-def plot_velocity_per_run(runs, forward_axis, smoothing_window):
-    """Two-panel plot per run: smoothed acceleration + integrated velocity,
-       with roll angle overlaid on the acceleration plot."""
+def _classify_phases(t, v, cruise_tolerance):
+    """
+    Classify every sample into one of three phases based on velocity
+    relative to the overall peak:
+
+      ACCELERATION : before the peak and not yet within cruise_tolerance of it
+      CRUISE       : within cruise_tolerance fraction of the peak velocity
+                     (may occur both before and after the numerical peak
+                      if the bike held a steady speed)
+      BRAKING      : after the peak and below cruise band
+
+    This approach avoids using dv/dt, which is noisy and falsely flags
+    small fluctuations during steady riding as braking events.
+
+    Returns three boolean arrays (acceleration, cruise, braking) of
+    length len(t), all mutually exclusive.
+    """
+    peak_idx   = int(np.argmax(v))
+    v_peak     = v[peak_idx]
+    cruise_lo  = v_peak * (1.0 - cruise_tolerance)
+
+    n = len(t)
+    accel_mask  = np.zeros(n, dtype=bool)
+    cruise_mask = np.zeros(n, dtype=bool)
+    brake_mask  = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        if v[i] >= cruise_lo:
+            # Within cruise band — regardless of whether before or after peak
+            cruise_mask[i] = True
+        elif i <= peak_idx:
+            # Below cruise band and still climbing to peak
+            accel_mask[i]  = True
+        else:
+            # Below cruise band and past peak — braking
+            brake_mask[i]  = True
+
+    return accel_mask, cruise_mask, brake_mask
+
+
+def plot_velocity_per_run(runs, forward_axis, smoothing_window,
+                          cruise_tolerance=CRUISE_TOLERANCE):
+    """
+    Professional single-panel velocity plot for report use.
+
+    Shading:
+      Blue   — acceleration phase (velocity building toward peak)
+      Green  — sustained cruise phase (within cruise_tolerance of peak)
+      Red    — braking phase (velocity falling after peak)
+
+    Peak is marked with a dot and clean label (m/s with mph equivalent).
+    No arrow annotation. Top/right spines removed for academic style.
+    """
+    plt.rcParams.update({
+        'font.family':      'sans-serif',
+        'font.size':        11,
+        'axes.linewidth':   0.8,
+        'axes.edgecolor':   '#333333',
+        'axes.grid':        True,
+        'grid.color':       '#e0e0e0',
+        'grid.linewidth':   0.55,
+        'grid.linestyle':   '-',
+        'xtick.direction':  'out',
+        'ytick.direction':  'out',
+        'xtick.major.size': 4,
+        'ytick.major.size': 4,
+        'figure.dpi':       150,
+    })
+
     n_runs = len(runs)
     print(f"\nPlotting {n_runs} test run(s)...")
 
@@ -331,73 +311,92 @@ def plot_velocity_per_run(runs, forward_axis, smoothing_window):
         if 'velocity' not in run.columns:
             continue
 
-        duration    = run['Time_rel'].iloc[-1]
-        n_rows      = len(run)
-        start_t     = run['Time_sec'].iloc[0]
-        h = int(start_t // 3600)
-        m = int((start_t % 3600) // 60)
-        s = int(start_t % 60)
-        start_label = f'{h:02d}:{m:02d}:{s:02d}'
-        v_max       = run['velocity'].max()
-        v_max_mph   = v_max * 2.237
+        t        = run['Time_rel'].values
+        v        = run['velocity'].values
+        duration = t[-1]
+        n_rows   = len(run)
+        start_t  = run['Time_sec'].iloc[0]
+        h  = int(start_t // 3600)
+        m  = int((start_t % 3600) // 60)
+        s  = int(start_t % 60)
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-        fig.suptitle(
-            f'Test Run {idx + 1} of {n_runs}  |  Start: {start_label}  |  '
-            f'Duration: {duration:.2f}s  |  {n_rows} samples  |  '
-            f'Forward axis: {forward_axis}',
-            fontsize=11
+        v_peak     = v.max()
+        v_peak_mph = v_peak * 2.237
+        t_peak     = t[np.argmax(v)]
+
+        accel_mask, cruise_mask, brake_mask = _classify_phases(
+            t, v, cruise_tolerance
         )
 
-        # ============================================================
-        # Top plot: Forward acceleration
-        # ============================================================
-        ax1.plot(run['Time_rel'], run['fwd_accel_smooth'],
-                 color='steelblue', linewidth=1.4,
-                 label=f'Forward accel — smoothed (window={smoothing_window})')
+        fig, ax = plt.subplots(figsize=(10, 5))
 
-        ax1.axhline(y=0, color='black', linewidth=0.7)
-        ax1.set_ylabel('Acceleration (m/s²)')
-        ax1.grid(True, alpha=0.35)
+        # --- Phase shading ------------------------------------------
+        ax.fill_between(t, 0, v, where=accel_mask,
+                        color='#1565C0', alpha=0.13, label='_')
+        ax.fill_between(t, 0, v, where=cruise_mask,
+                        color='#2E7D32', alpha=0.13, label='_')
+        ax.fill_between(t, 0, v, where=brake_mask,
+                        color='#B71C1C', alpha=0.13, label='_')
 
-        # ============================================================
-        # Overlay roll angle on secondary axis
-        # ============================================================
-        if 'Roll' in run.columns:
-            # Optional smoothing (uncomment if needed)
-            # roll_data = pd.Series(run['roll']).rolling(
-            #     window=25, min_periods=1, center=True
-            # ).mean()
-            roll_data = run['Roll']
+        # --- Zero line ----------------------------------------------
+        ax.axhline(y=0, color='#444444', linewidth=0.8, zorder=2)
 
-            ax1b = ax1.twinx()
-            ax1b.plot(run['Time_rel'], roll_data,
-                      color='crimson', linewidth=1.2, alpha=0.8,
-                      label='Roll angle (deg)')
-            ax1b.set_ylabel('Roll angle (deg)', color='crimson')
-            ax1b.tick_params(axis='y', labelcolor='crimson')
+        # --- Velocity trace -----------------------------------------
+        ax.plot(t, v,
+                color='#1A237E', linewidth=2.0, zorder=3,
+                label='Measured velocity')
 
-            # Combine legends
-            lines_1, labels_1 = ax1.get_legend_handles_labels()
-            lines_2, labels_2 = ax1b.get_legend_handles_labels()
-            ax1.legend(lines_1 + lines_2, labels_1 + labels_2, fontsize=9)
-        else:
-            ax1.legend(fontsize=9)
+        # --- Peak marker (dot + text label, no arrow) ---------------
+        ax.plot(t_peak, v_peak,
+                marker='o', markersize=7,
+                color='#C62828', zorder=5,
+                label=f'Peak velocity: {v_peak:.2f} m/s  ({v_peak_mph:.1f} mph)')
 
-        # ============================================================
-        # Bottom plot: Velocity
-        # ============================================================
-        ax2.plot(run['Time_rel'], run['velocity'],
-                 color='darkorange', linewidth=1.8,
-                 label=f'Velocity  |  Peak: {v_max:.2f} m/s ({v_max_mph:.1f} mph)')
-        ax2.axhline(y=0, color='black', linewidth=0.7)
-        ax2.set_xlabel('Time from start of run (seconds)')
-        ax2.set_ylabel('Velocity (m/s)')
-        ax2.legend(fontsize=9)
-        ax2.grid(True, alpha=0.35)
+        # Offset label slightly above and to the right of the dot
+        label_x = t_peak + duration * 0.02
+        label_y = v_peak + v_peak * 0.06
+        ax.text(label_x, label_y,
+                f'{v_peak:.2f} m/s\n({v_peak_mph:.1f} mph)',
+                fontsize=9, color='#C62828',
+                va='bottom', ha='left',
+                bbox=dict(boxstyle='round,pad=0.25', fc='white',
+                          ec='#C62828', alpha=0.88, lw=0.7),
+                zorder=6)
+
+        # --- Legend (phase patches + trace + peak) ------------------
+        accel_patch  = mpatches.Patch(color='#1565C0', alpha=0.4,
+                                      label='Acceleration')
+        cruise_patch = mpatches.Patch(color='#2E7D32', alpha=0.4,
+                                      label='Sustained speed')
+        brake_patch  = mpatches.Patch(color='#B71C1C', alpha=0.4,
+                                      label='Braking')
+
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles + [accel_patch, cruise_patch, brake_patch],
+                  labels  + ['Acceleration', 'Sustained speed', 'Braking'],
+                  loc='upper left', fontsize=9.5,
+                  framealpha=0.92, edgecolor='#cccccc')
+
+        # --- Axes labels & formatting --------------------------------
+        ax.set_xlabel('Time from start of run (s)', fontsize=11)
+        ax.set_ylabel('Velocity (m/s)',              fontsize=11)
+        ax.set_title(
+            f'Velocity Profile — Test Run {idx + 1} of {n_runs}'
+            f'  |  Duration: {duration:.1f} s  |  {n_rows} samples @ ~250 Hz',
+            fontsize=11, pad=10
+        )
+
+        ax.set_xlim(left=0, right=duration * 1.02)
+        y_bottom = min(v.min() * 1.2, -0.3)
+        ax.set_ylim(bottom=y_bottom, top=v_peak * 1.28)
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
 
         plt.tight_layout()
         plt.show()
+
+    plt.rcParams.update(plt.rcParamsDefault)
 
 
 def main():
@@ -416,12 +415,10 @@ def main():
     df = pd.read_excel(xlsx_path)
     df = parse_time_to_seconds(df)
 
-    # Measure per-axis sensor bias from idle period at start of data
     bias = measure_sensor_bias(df, GRAVITY_CALIBRATION_SECONDS)
-
-    # Subtract bias from raw readings — removes hardware offsets and gravity
-    df = normalize_acceleration(df, bias=bias)
-    df = smooth_acceleration(df, window=SMOOTHING_WINDOW)
+    df   = normalize_acceleration(df, bias=bias,
+                                  roll_threshold_deg=ROLL_THRESHOLD_DEG)
+    df   = smooth_acceleration(df, window=SMOOTHING_WINDOW)
 
     small_crashes, large_crashes = detect_crashes(
         df, SMALL_CRASH_THRESHOLD, LARGE_CRASH_THRESHOLD, COOLDOWN_TIME
@@ -432,11 +429,11 @@ def main():
           f"(~{SMOOTHING_WINDOW / 250 * 1000:.0f} ms at 250 Hz)")
     print(f"Velocity smooth window: {VELOCITY_SMOOTHING_WINDOW} samples "
           f"(~{VELOCITY_SMOOTHING_WINDOW / 250 * 1000:.0f} ms at 250 Hz)")
+    print(f"Roll threshold        : {ROLL_THRESHOLD_DEG}°")
     print(f"Gravity calibration   : {GRAVITY_CALIBRATION_SECONDS}s "
           f"→ bias x={bias['x']:+.4f}  y={bias['y']:+.4f}  z={bias['z']:+.4f} m/s²")
-    print(f"Stationary threshold  : {STATIONARY_THRESHOLD} m/s²  "
-          f"hold {STATIONARY_HOLD_SAMPLES} samples "
-          f"(~{STATIONARY_HOLD_SAMPLES / 250 * 1000:.0f} ms)")
+    print(f"Stationary threshold  : {STATIONARY_THRESHOLD} m/s")
+    print(f"Cruise tolerance      : ±{CRUISE_TOLERANCE*100:.0f}% of peak velocity")
     print(f"Gap threshold         : {GAP_THRESHOLD_S}s")
     print(f"Small crashes         : {len(small_crashes)}")
     print(f"  Times (s)           : {[f'{t:.3f}' for t, _ in small_crashes]}")
@@ -463,7 +460,8 @@ def main():
     plot_acceleration_data(
         df, SMALL_CRASH_THRESHOLD, LARGE_CRASH_THRESHOLD, SMOOTHING_WINDOW
     )
-    plot_velocity_per_run(runs_with_velocity, FORWARD_AXIS, VELOCITY_SMOOTHING_WINDOW)
+    plot_velocity_per_run(runs_with_velocity, FORWARD_AXIS,
+                          VELOCITY_SMOOTHING_WINDOW, CRUISE_TOLERANCE)
 
 
 if __name__ == "__main__":
