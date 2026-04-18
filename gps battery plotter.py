@@ -11,13 +11,13 @@ from text_to_excel import process_data_file
 # Constants
 # -----------------------
 GPS_INITIAL_LOCK    = 5      # seconds to ignore at start
-MAX_REALISTIC_ACCEL = 6.0   # m/s², maximum plausible acceleration
+MAX_REALISTIC_ACCEL = 6.0   # m/s^2, maximum plausible acceleration
 SMOOTHING_WINDOW    = 20     # number of points for rolling average smoothing
 
 # Line width tuning
-LINE_WIDTH_SMALL_MAP = 12   # line width for maps ≤ SMALL_MAP_THRESHOLD km²
+LINE_WIDTH_SMALL_MAP = 12   # line width for maps <= SMALL_MAP_THRESHOLD km^2
 LINE_WIDTH_LARGE_MAP = 4    # line width for larger maps
-SMALL_MAP_THRESHOLD  = 10.0  # km² — maps at or below this use the wider line
+SMALL_MAP_THRESHOLD  = 10.0  # km^2 - maps at or below this use the wider line
 
 # Velocity colour scaling
 N_VELOCITY_COLOURS  = 10    # total number of discrete colour bands
@@ -91,7 +91,7 @@ def filter_velocity_by_acceleration(df):
 
 
 # -----------------------
-# Smooth velocity — rolling mean only
+# Smooth velocity - rolling mean only
 # -----------------------
 def smooth_velocity(df, window=SMOOTHING_WINDOW):
     """
@@ -107,7 +107,7 @@ def smooth_velocity(df, window=SMOOTHING_WINDOW):
 
 
 # -----------------------
-# Estimate map area in km²
+# Estimate map area in km^2
 # -----------------------
 def estimate_map_area_km2(df):
     lat_range = df['Lat'].max() - df['Lat'].min()
@@ -128,7 +128,7 @@ def compute_total_distance(df):
     """
     times      = df['Time_sec'].values
     velocities = df['velocity_smoothed'].values
-    total_m    = np.trapz(velocities, times)
+    total_m    = np.trapezoid(velocities, times)
     total_km   = total_m / 1000.0
     return total_m, total_km
 
@@ -153,7 +153,7 @@ def load_battery_data_from_df(df):
 def plot_velocity_map(df, df_bat):
     area_km2   = estimate_map_area_km2(df)
     line_width = LINE_WIDTH_SMALL_MAP if area_km2 <= SMALL_MAP_THRESHOLD else LINE_WIDTH_LARGE_MAP
-    print(f"Map bounding-box area: {area_km2:.2f} km²  →  line width = {line_width}")
+    print(f"Map bounding-box area: {area_km2:.2f} km^2  ->  line width = {line_width}")
 
     garmin_colours = [
         "#1B4F9C", "#1E6FD6", "#2FA4FF", "#39D2C0",
@@ -164,21 +164,31 @@ def plot_velocity_map(df, df_bat):
 
     v = df['velocity_smoothed'].values
 
-    # Clamp colour scale to the central (100 - 2*TAIL_PERCENTILE)% of the data.
-    # Points below v_low get the darkest blue; points above v_high get the
-    # darkest red.  The eight middle colours span [v_low, v_high] linearly.
     v_low  = np.percentile(v, TAIL_PERCENTILE)
     v_high = np.percentile(v, 100.0 - TAIL_PERCENTILE)
 
-    bounds = np.linspace(v_low, v_high, N_VELOCITY_COLOURS - 1)   # 9 inner edges
-    # Add sentinels so the bottom and top bands catch all outliers
-    bounds = np.concatenate(([-np.inf], bounds, [np.inf]))          # 11 edges → 10 bands
-
-    norm = mcolors.BoundaryNorm(bounds, ncolors=N_VELOCITY_COLOURS)
+    # Guard against degenerate velocity range (e.g. all-zero during GPS freeze)
+    if v_high <= v_low:
+        v_high = v_low + 1.0
 
     print(f"Colour clamp: {TAIL_PERCENTILE}th pct = {v_low:.2f} m/s, "
           f"{100-TAIL_PERCENTILE}th pct = {v_high:.2f} m/s  |  "
-          f"full range {v.min():.2f}–{v.max():.2f} m/s")
+          f"full range {v.min():.2f}-{v.max():.2f} m/s")
+
+    # Build finite bounds for both the norm and the colourbar.
+    # Using only finite values avoids the matplotlib "Axis limits cannot be
+    # NaN or Inf" crash that occurs when +-inf sentinels are passed to
+    # BoundaryNorm or fig.colorbar. BoundaryNorm naturally clamps any values
+    # outside the boundary range, so the sentinels are not needed.
+    band_width    = (v_high - v_low) / (N_VELOCITY_COLOURS - 2)
+    inner_edges   = np.linspace(v_low, v_high, N_VELOCITY_COLOURS - 1)
+    finite_bounds = np.concatenate((
+        [v_low  - band_width],   # finite stand-in for -inf (tail band)
+        inner_edges,             # 9 real inner edges (all finite)
+        [v_high + band_width],   # finite stand-in for +inf (tail band)
+    ))
+
+    norm = mcolors.BoundaryNorm(finite_bounds, ncolors=N_VELOCITY_COLOURS)
 
     fig, ax = plt.subplots(figsize=(12, 12))
 
@@ -213,15 +223,6 @@ def plot_velocity_map(df, df_bat):
         )
         ax.legend(loc='lower right', fontsize=11)
 
-    # Colourbar — replace the ±inf sentinel bounds with finite display values
-    # so matplotlib can render the colourbar axis without crashing.
-    band_width     = (v_high - v_low) / (N_VELOCITY_COLOURS - 2)
-    finite_bounds  = np.concatenate((
-        [v_low  - band_width],   # finite stand-in for -inf (tail band)
-        bounds[1:-1],            # the 9 real inner edges
-        [v_high + band_width],   # finite stand-in for +inf (tail band)
-    ))
-
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04,
@@ -231,16 +232,15 @@ def plot_velocity_map(df, df_bat):
         f"Velocity (m/s)  [bottom/top {TAIL_PERCENTILE}% clamped]",
         rotation=270, labelpad=22
     )
-    # Label each tick with its velocity; mark the two tail bands clearly
     tick_labels = (
-        [f"≤{v_low:.1f}"]
-        + [f"{b:.1f}" for b in bounds[1:-1][:-1]]
-        + [f"≥{v_high:.1f}"]
+        [f"<={v_low:.1f}"]
+        + [f"{b:.1f}" for b in inner_edges]
+        + [f">={v_high:.1f}"]
     )
     cbar.set_ticklabels(tick_labels)
 
     ax.set_title(
-        f"GPS Velocity Map — {datetime.now().strftime('%Y-%m-%d')}",
+        f"GPS Velocity Map - {datetime.now().strftime('%Y-%m-%d')}",
         fontsize=16
     )
     ax.set_aspect('equal')
