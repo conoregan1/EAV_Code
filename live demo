@@ -1,0 +1,427 @@
+"""
+ESP32 Sensor Logger — 3D Rotation Viewer
+==========================================
+
+Plays back a recording from the ESP32 sensor box as a smooth, real-time
+3D animation: a coloured cuboid that rotates exactly the way the
+physical sensor box was rotated, with labelled X/Y/Z body axes.
+
+Designed for live demonstrations:
+  - DEMO_FILE  → set to a specific .xlsx for testing on a known recording
+  - None       → automatically picks the most recently modified .xlsx in
+                 DATA_FOLDER (so you can record on the day, hit "save",
+                 then run this script and it just works)
+
+Smoothing pipeline (so the animation doesn't shake):
+  1. Parse HH:MM:SS.mmm timestamps to seconds-since-start.
+  2. Unwrap yaw (handles 359°→0° wrap-around if it ever happens).
+  3. Linearly resample to a uniform PLAYBACK_FPS grid — this fixes
+     the ~165 ms gaps that appear once per second when the firmware
+     flushes the sample buffer to the SD card.
+  4. Savitzky-Golay filter (window ≈ 180 ms, polyorder 3) — smooths
+     out IMU noise without flattening the actual rotation peaks.
+  5. Zero out the starting yaw so the box faces the camera at t=0.
+
+Press Q or close the window to quit.
+"""
+
+import os
+import sys
+import glob
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
+
+from scipy.signal import savgol_filter
+
+
+# ===================================================================
+# CONFIGURATION — edit these for your machine
+# ===================================================================
+
+# Folder where the website saves .xlsx files.
+# On the day, leave DEMO_FILE = None and this script will pick the
+# newest .xlsx in this folder automatically.
+DATA_FOLDER = r'C:/Users/conor/OneDrive/Documents/EAV_Data'
+
+# Set to a specific path to test against a known recording.
+# Set to None to use "newest file in DATA_FOLDER" mode (live demo).
+DEMO_FILE = r'C:/Users/conor/OneDrive/Documents/EAV_Data/2026-04-03_RPY.xlsx'
+# DEMO_FILE = None
+
+# Playback settings
+PLAYBACK_FPS    = 60      # animation frame rate (60 = smooth)
+PLAYBACK_SPEED  = 1.0     # 1.0 = real time, 0.5 = half speed, 2.0 = double speed
+SMOOTHING_MS    = 180     # Savitzky-Golay window in milliseconds
+ZERO_START_YAW  = True    # rotate so the box starts facing the camera
+
+# Visual settings
+BOX_DIMS        = (2.775, 0.96, 0.795)   # X, Y, Z half-lengths of the cuboid
+TRAIL_LENGTH    = 30                # trail length in frames (shared by all axes)
+
+# Per-axis trail toggles — set each to True or False independently
+TRAIL_X = True    # red   — forward/nose direction
+TRAIL_Y = True    # green — right direction
+TRAIL_Z = True    # blue  — up direction
+
+# Colours — face colours give the box a clear orientation from any angle
+FACE_COLOURS = {
+    '+X': '#ef4444',  # front  — red
+    '-X': '#7f1d1d',  # back   — dark red
+    '+Y': '#22c55e',  # right  — green
+    '-Y': '#14532d',  # left   — dark green
+    '+Z': '#3b82f6',  # top    — blue
+    '-Z': '#1e3a8a',  # bottom — dark blue
+}
+
+
+# ===================================================================
+# File picking — newest file in folder, or a specific override
+# ===================================================================
+def pick_data_file():
+    """Returns the path to the .xlsx we should play back."""
+    if DEMO_FILE is not None:
+        if not os.path.exists(DEMO_FILE):
+            sys.exit(f"DEMO_FILE not found: {DEMO_FILE}")
+        print(f"📂 Using DEMO_FILE: {DEMO_FILE}")
+        return DEMO_FILE
+
+    if not os.path.isdir(DATA_FOLDER):
+        sys.exit(f"DATA_FOLDER does not exist: {DATA_FOLDER}\n"
+                 f"   Create it, or set DEMO_FILE to a specific .xlsx.")
+
+    candidates = glob.glob(os.path.join(DATA_FOLDER, '*.xlsx'))
+    if not candidates:
+        sys.exit(f"No .xlsx files found in {DATA_FOLDER}.\n"
+                 f"   Save a recording from the website first.")
+
+    newest = max(candidates, key=os.path.getmtime)
+    print(f"📂 Newest file in {DATA_FOLDER}: {os.path.basename(newest)}")
+    return newest
+
+
+# ===================================================================
+# Data loading & smoothing
+# ===================================================================
+def parse_time_str(t):
+    """HH:MM:SS.mmm → seconds (float)."""
+    h, m, s = t.split(':')
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def load_and_smooth(xlsx_path):
+    """Returns a dict with uniform-grid time/roll/pitch/yaw arrays in degrees."""
+    print(f"📥 Loading {os.path.basename(xlsx_path)}...")
+    df = pd.read_excel(xlsx_path)
+
+    required = {'Time', 'Roll', 'Pitch', 'Yaw'}
+    missing = required - set(df.columns)
+    if missing:
+        sys.exit(f"Missing columns in xlsx: {missing}")
+
+    # Times → seconds since start
+    t_raw = df['Time'].apply(parse_time_str).values.astype(float).copy()
+    t_raw -= t_raw[0]
+
+    roll  = df['Roll'].values.astype(float).copy()
+    pitch = df['Pitch'].values.astype(float).copy()
+    yaw   = df['Yaw'].values.astype(float).copy()
+
+    duration = t_raw[-1]
+    n_raw    = len(df)
+    print(f"   {n_raw:,} samples over {duration:.1f}s "
+          f"(≈{n_raw/duration:.0f} Hz logged)")
+
+    # Unwrap yaw — converts 359→1 step into a continuous 359→361 so
+    # interpolation and smoothing don't see a huge fake jump.
+    yaw_unwrapped = np.degrees(np.unwrap(np.radians(yaw)))
+
+    # Uniform time grid at PLAYBACK_FPS
+    t_uniform = np.arange(0.0, duration, 1.0 / PLAYBACK_FPS)
+    roll_u  = np.interp(t_uniform, t_raw, roll)
+    pitch_u = np.interp(t_uniform, t_raw, pitch)
+    yaw_u   = np.interp(t_uniform, t_raw, yaw_unwrapped)
+
+    # Savitzky-Golay window in samples (must be odd and > polyorder)
+    win = max(5, int(round(SMOOTHING_MS / 1000.0 * PLAYBACK_FPS)))
+    if win % 2 == 0:
+        win += 1
+    win = min(win, len(t_uniform) - 1 if (len(t_uniform) - 1) % 2 == 1
+                       else len(t_uniform) - 2)
+    if win >= 5:
+        roll_s  = savgol_filter(roll_u,  win, 3)
+        pitch_s = savgol_filter(pitch_u, win, 3)
+        yaw_s   = savgol_filter(yaw_u,   win, 3)
+        print(f"   Smoothed with Savitzky-Golay (window={win} frames "
+              f"≈ {win*1000/PLAYBACK_FPS:.0f}ms)")
+    else:
+        roll_s, pitch_s, yaw_s = roll_u, pitch_u, yaw_u
+        print(f"   Recording too short for smoothing — using raw")
+
+    # Zero the starting yaw so the cuboid faces the camera at t=0
+    if ZERO_START_YAW:
+        yaw_s = yaw_s - yaw_s[0]
+
+    print(f"   Peaks:  Roll [{roll_s.min():+.1f}°, {roll_s.max():+.1f}°]"
+          f"   Pitch [{pitch_s.min():+.1f}°, {pitch_s.max():+.1f}°]"
+          f"   Yaw [{yaw_s.min():+.1f}°, {yaw_s.max():+.1f}°]")
+    print(f"   Resampled to {len(t_uniform)} frames at {PLAYBACK_FPS} fps")
+
+    return {
+        't':     t_uniform,
+        'roll':  roll_s,
+        'pitch': pitch_s,
+        'yaw':   yaw_s,
+        'duration': duration,
+        'filename': os.path.basename(xlsx_path),
+    }
+
+
+# ===================================================================
+# Geometry — rotation matrix and cuboid vertices
+# ===================================================================
+def rpy_to_matrix(roll_deg, pitch_deg, yaw_deg):
+    """Aerospace Z-Y-X intrinsic Euler convention: R = Rz(yaw) @ Ry(pitch) @ Rx(roll).
+    Pitch is negated here because the Madgwick filter running on the ESP32 produces
+    positive pitch = nose DOWN (sensor Z is up), whereas the visual convention is
+    positive pitch = nose UP.  Negating pitch corrects this without touching the
+    physically-verified roll or yaw directions."""
+    r, p, y = np.radians(roll_deg), np.radians(-pitch_deg), np.radians(yaw_deg)
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    return np.array([
+        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+        [-sp,   cp*sr,            cp*cr]
+    ])
+
+
+def cuboid_geometry(half_dims):
+    """Returns (vertices 8x3, faces list-of-4-vertex-indices, face_keys)."""
+    sx, sy, sz = half_dims
+    verts = np.array([
+        [-sx, -sy, -sz],  # 0
+        [+sx, -sy, -sz],  # 1
+        [+sx, +sy, -sz],  # 2
+        [-sx, +sy, -sz],  # 3
+        [-sx, -sy, +sz],  # 4
+        [+sx, -sy, +sz],  # 5
+        [+sx, +sy, +sz],  # 6
+        [-sx, +sy, +sz],  # 7
+    ])
+    # Face vertex indices ordered so the right-hand normal points outward
+    faces = [
+        ([1, 2, 6, 5], '+X'),  # +X face (front, red)
+        ([0, 4, 7, 3], '-X'),  # -X face (back)
+        ([2, 3, 7, 6], '+Y'),  # +Y face (right, green)
+        ([0, 1, 5, 4], '-Y'),  # -Y face (left)
+        ([4, 5, 6, 7], '+Z'),  # +Z face (top, blue)
+        ([0, 3, 2, 1], '-Z'),  # -Z face (bottom)
+    ]
+    return verts, faces
+
+
+# ===================================================================
+# Animation
+# ===================================================================
+def run_animation(data):
+    base_verts, faces = cuboid_geometry(BOX_DIMS)
+    n_frames = len(data['t'])
+
+    # Body-frame axis arrows — drawn with arrow tail at origin, tip
+    # poking out a bit beyond the box face
+    axis_len = max(BOX_DIMS) * 1.6
+    axis_dirs = {
+        'X': (np.array([axis_len, 0, 0]), '#ef4444'),
+        'Y': (np.array([0, axis_len, 0]), '#22c55e'),
+        'Z': (np.array([0, 0, axis_len]), '#3b82f6'),
+    }
+
+    # ---------- Figure / styling — white background ----------
+    plt.rcdefaults()  # reset any previously applied style
+    fig = plt.figure(figsize=(13, 8))
+    fig.patch.set_facecolor('white')
+
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_facecolor('white')
+
+    lim = max(BOX_DIMS) * 2.4
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_zlim(-lim, lim)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass
+
+    # Hide most of the default chart junk; keep faint world-frame lines
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+    for spine in ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane:
+        spine.set_facecolor((0.94, 0.95, 0.97, 0.7))
+        spine.set_edgecolor('#c8cdd8')
+    ax.grid(False)
+
+    # World-frame reference lines (faint, dashed)
+    ref_len = lim * 0.95
+    ax.plot([-ref_len, ref_len], [0, 0], [0, 0], color='#b0b8c8',
+            linestyle='--', linewidth=0.8, zorder=1)
+    ax.plot([0, 0], [-ref_len, ref_len], [0, 0], color='#b0b8c8',
+            linestyle='--', linewidth=0.8, zorder=1)
+    ax.plot([0, 0], [0, 0], [-ref_len, ref_len], color='#b0b8c8',
+            linestyle='--', linewidth=0.8, zorder=1)
+
+    # World-frame axis labels at the ends of those reference lines —
+    # so the audience can see "this box is rotating relative to a fixed frame"
+    ax.text(ref_len, 0, 0, ' X', color='#94a3b8', fontsize=9)
+    ax.text(0, ref_len, 0, ' Y', color='#94a3b8', fontsize=9)
+    ax.text(0, 0, ref_len, ' Z', color='#94a3b8', fontsize=9)
+
+    # Initial camera angle — a friendly 3/4 view
+    ax.view_init(elev=22, azim=-55)
+
+    # ---------- Build the cuboid faces ----------
+    face_polys = Poly3DCollection(
+        [base_verts[f] for f, _ in faces],
+        facecolors=[FACE_COLOURS[k] for _, k in faces],
+        edgecolors='white',
+        linewidths=1.6,
+        alpha=0.92,
+    )
+    ax.add_collection3d(face_polys)
+
+    # ---------- Body-axis arrows (lines + tip text) ----------
+    # We draw each axis as one Line3D from origin → tip, then a Text3D
+    # at the tip. We update both per frame.
+    axis_lines = {}
+    axis_texts = {}
+    for name, (vec, colour) in axis_dirs.items():
+        line, = ax.plot([0, vec[0]], [0, vec[1]], [0, vec[2]],
+                        color=colour, linewidth=2.6, zorder=10)
+        text = ax.text(vec[0], vec[1], vec[2], name,
+                       color=colour, fontsize=11, fontweight='bold', zorder=11)
+        axis_lines[name] = line
+        axis_texts[name] = text
+
+    # Optional fading trails — one per axis, each using that axis's colour.
+    # Initialised with a zero-length dummy segment to avoid a matplotlib bug
+    # where add_collection3d() on an empty Line3DCollection crashes.
+    TRAIL_FLAGS = {'X': TRAIL_X, 'Y': TRAIL_Y, 'Z': TRAIL_Z}
+    # RGB colours matching the axis arrows, as 0-1 floats for colour blending
+    TRAIL_RGBS  = {
+        'X': (0.863, 0.149, 0.149),   # #dc2626 red
+        'Y': (0.086, 0.639, 0.290),   # #16a34a green
+        'Z': (0.145, 0.388, 0.922),   # #2563eb blue
+    }
+    trail_lines = {}
+    trail_pts   = {name: [] for name in ('X', 'Y', 'Z')}
+    for name, (_, colour) in axis_dirs.items():
+        if TRAIL_FLAGS[name]:
+            lc = Line3DCollection([[[0, 0, 0], [0, 0, 0]]],
+                                  colors=colour, linewidths=1.6, alpha=0.6)
+            ax.add_collection3d(lc)
+            trail_lines[name] = lc
+
+    # ---------- HUD text (top-left) ----------
+    title_text = fig.text(0.02, 0.96, 'ESP32 Sensor Logger — 3D Rotation Playback',
+                          fontsize=15, fontweight='bold', color='#1e293b')
+    file_text  = fig.text(0.02, 0.93, f"file: {data['filename']}",
+                          fontsize=9, color='#64748b', family='monospace')
+
+    hud_props = dict(fontsize=11, color='#1e293b', family='monospace',
+                     verticalalignment='top')
+    time_text  = fig.text(0.02, 0.88, '', **hud_props)
+    roll_text  = fig.text(0.02, 0.84, '', color='#dc2626',   # increased gap: 0.85→0.84
+                          family='monospace', fontsize=11)
+    pitch_text = fig.text(0.02, 0.80, '', color='#16a34a',
+                          family='monospace', fontsize=11)
+    yaw_text   = fig.text(0.02, 0.76, '', color='#2563eb',
+                          family='monospace', fontsize=11)
+
+    speed_text = fig.text(0.98, 0.96,
+                          f'{PLAYBACK_SPEED:g}x real-time   |   '
+                          f'{PLAYBACK_FPS} fps   |   {data["duration"]:.1f}s total',
+                          fontsize=9, color='#64748b', family='monospace',
+                          horizontalalignment='right')
+
+    legend_text = fig.text(0.98, 0.05,
+                           'Body axes:  X (red, forward)   Y (green, right)   Z (blue, up)',
+                           fontsize=8.5, color='#64748b', family='monospace',
+                           horizontalalignment='right')
+
+    # ---------- Per-frame update ----------
+    def update(frame_idx):
+        roll_d  = data['roll'][frame_idx]
+        pitch_d = data['pitch'][frame_idx]
+        yaw_d   = data['yaw'][frame_idx]
+        t_now   = data['t'][frame_idx]
+
+        R = rpy_to_matrix(roll_d, pitch_d, yaw_d)
+
+        # Rotate the box vertices and update each face polygon
+        rotated_verts = base_verts @ R.T
+        face_polys.set_verts([rotated_verts[f] for f, _ in faces])
+
+        # Rotate body axes
+        for name, (vec, _) in axis_dirs.items():
+            tip = R @ vec
+            axis_lines[name].set_data_3d([0, tip[0]], [0, tip[1]], [0, tip[2]])
+            axis_texts[name].set_position_3d((tip[0]*1.08, tip[1]*1.08, tip[2]*1.08))
+
+        # Fading trails — one per enabled axis
+        for name, (vec, _) in axis_dirs.items():
+            if name not in trail_lines:
+                continue
+            tip = R @ vec
+            trail_pts[name].append(tip.copy())
+            if len(trail_pts[name]) > TRAIL_LENGTH:
+                trail_pts[name].pop(0)
+            pts = trail_pts[name]
+            if len(pts) >= 2:
+                segs = [[pts[i], pts[i+1]] for i in range(len(pts) - 1)]
+                trail_lines[name].set_segments(segs)
+                alphas  = np.linspace(0.04, 0.65, len(segs))
+                rgb     = TRAIL_RGBS[name]
+                colours = np.array([[rgb[0], rgb[1], rgb[2], a] for a in alphas])
+                trail_lines[name].set_color(colours)
+
+        # HUD update
+        time_text.set_text(f't  = {t_now:6.2f} s   ({frame_idx+1}/{n_frames})')
+        roll_text.set_text(f'Roll  = {roll_d:+7.2f}°')
+        pitch_text.set_text(f'Pitch = {pitch_d:+7.2f}°')
+        yaw_text.set_text(f'Yaw   = {yaw_d:+7.2f}°')
+
+        # We must return all changed artists for blit, but we use blit=False
+        return ()
+
+    # ---------- Run ----------
+    interval_ms = 1000.0 / (PLAYBACK_FPS * PLAYBACK_SPEED)
+    anim = FuncAnimation(
+        fig, update,
+        frames=n_frames,
+        interval=interval_ms,
+        blit=False,
+        repeat=True,
+        cache_frame_data=False,
+    )
+
+    print(f"\n▶ Playing {n_frames} frames at {PLAYBACK_FPS} fps "
+          f"({PLAYBACK_SPEED:g}× speed). Close the window or press Q to quit.\n")
+
+    plt.show()
+    return anim
+
+
+# ===================================================================
+# Main
+# ===================================================================
+if __name__ == '__main__':
+    xlsx = pick_data_file()
+    data = load_and_smooth(xlsx)
+    run_animation(data)
