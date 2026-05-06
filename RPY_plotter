@@ -1,0 +1,260 @@
+"""
+RPY Sensor Convergence Analysis
+3-phase shading: converging to target, held at target, converging back to 0
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+
+# ──────────────────────────────────────────────
+# FONT SIZE CONTROL
+# ──────────────────────────────────────────────
+BASE_FONT_SIZE = 10
+
+# ──────────────────────────────────────────────
+# LOAD DATA
+# ──────────────────────────────────────────────
+file_path = "2026-04-03_RPY.xlsx"
+df = pd.read_excel(file_path)
+
+TIME_COL  = "Time"
+ROLL_COL  = "Roll"
+PITCH_COL = "Pitch"
+YAW_COL   = "Yaw"
+
+df[TIME_COL] = pd.to_datetime(df[TIME_COL], format='%H:%M:%S.%f')
+
+# ──────────────────────────────────────────────
+# PER-AXIS CONFIG
+# ──────────────────────────────────────────────
+AXIS_CONFIG = {
+    ROLL_COL: {
+        "slice":      (100,    1600),
+        "target_hi":  85,
+        "thresh_hi":  3,
+        "target_lo":  0,
+        "thresh_lo":  2,
+        "color":      "tab:red",
+        "label":      "Roll",
+        "ylabel":     "Roll (deg)",
+    },
+    PITCH_COL: {
+        "slice":      (2200, 4000),
+        "target_hi":  85,
+        "thresh_hi":  3,
+        "target_lo":  0,
+        "thresh_lo":  2,
+        "color":      "tab:orange",
+        "label":      "Pitch",
+        "ylabel":     "Pitch (deg)",
+    },
+    YAW_COL: {
+        "slice":      (4000, 5200),
+        "target_hi":  75,
+        "thresh_hi":  3,
+        "target_lo":  0,
+        "thresh_lo":  7,
+        "color":      "tab:blue",
+        "label":      "Yaw",
+        "ylabel":     "Yaw (deg)",
+    },
+}
+
+SUSTAIN_SAMPLES = 50
+
+COLOR_CONVERGING_HI = "#E67E22"
+COLOR_HELD          = "#27AE60"
+COLOR_CONVERGING_LO = "#8E44AD"
+
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+def reset_time(data):
+    t0 = data[TIME_COL].iloc[0]
+    return (data[TIME_COL] - t0).dt.total_seconds().reset_index(drop=True)
+
+
+def find_first_convergence(signal, target, threshold,
+                           sustain=SUSTAIN_SAMPLES, search_from=0):
+    within = np.abs(np.array(signal) - target) <= threshold
+    count  = 0
+    for i in range(search_from, len(within)):
+        if within[i]:
+            count += 1
+            if count >= sustain:
+                return i - sustain + 1
+        else:
+            count = 0
+    return None
+
+
+def find_test_start(signal, thresh_lo):
+    sig_arr = np.array(signal)
+    for i in range(len(sig_arr)):
+        if np.abs(sig_arr[i]) > thresh_lo:
+            return i
+    return 0
+
+
+def classify_phases(t, sig, cfg):
+    sig_arr = np.array(sig)
+    n = len(sig_arr)
+
+    hi, thresh_hi = cfg["target_hi"], cfg["thresh_hi"]
+    lo, thresh_lo = cfg["target_lo"], cfg["thresh_lo"]
+
+    idx_start = find_test_start(sig_arr, thresh_lo)
+    idx_hi    = find_first_convergence(sig_arr, hi, thresh_hi, search_from=idx_start)
+    if idx_hi is None:
+        print(f"  WARNING: no convergence to {hi} deg found")
+        idx_hi = n - 1
+
+    held_end = n - 1
+    for i in range(idx_hi, n):
+        if sig_arr[i] < hi - thresh_hi:
+            held_end = i
+            break
+
+    idx_lo = find_first_convergence(sig_arr, lo, thresh_lo, search_from=held_end)
+    if idx_lo is None:
+        print(f"  WARNING: no convergence to {lo} deg found after held phase")
+        idx_lo = n - 1
+
+    phase1 = np.zeros(n, dtype=bool)
+    phase2 = np.zeros(n, dtype=bool)
+    phase3 = np.zeros(n, dtype=bool)
+
+    phase1[:idx_hi]         = True
+    phase2[idx_hi:held_end] = True
+    phase3[held_end:]       = True
+
+    return phase1, phase2, phase3, idx_start, idx_hi, held_end, idx_lo
+
+
+# ──────────────────────────────────────────────
+# FIGURE
+# ──────────────────────────────────────────────
+plt.rcdefaults()
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.rcParams.update({'font.size': BASE_FONT_SIZE})
+
+FIG_WIDTH  = 6.69
+FIG_HEIGHT = 4.00
+
+fig, axes = plt.subplots(3, 1, figsize=(FIG_WIDTH, FIG_HEIGHT), sharex=False)
+# No suptitle
+fig.subplots_adjust(hspace=0.80, left=0.12, right=0.97, top=0.95, bottom=0.12)
+
+for ax, col in zip(axes, [ROLL_COL, PITCH_COL, YAW_COL]):
+    cfg         = AXIS_CONFIG[col]
+    lo_i, hi_i  = cfg["slice"]
+    sub         = df.iloc[lo_i:hi_i].copy()
+    t           = reset_time(sub)
+    sig         = sub[col].reset_index(drop=True)
+    t_arr       = np.array(t)
+    sig_arr     = np.array(sig)
+
+    phase1, phase2, phase3, idx_start, idx_hi, idx_held_end, idx_lo = classify_phases(t, sig, cfg)
+
+    t_start          = t_arr[idx_start]
+    t_conv_hi        = t_arr[idx_hi]
+    t_held_end       = t_arr[idx_held_end]
+    t_conv_lo        = t_arr[idx_lo]
+    rise_duration    = t_conv_hi - t_start
+    descent_duration = t_conv_lo - t_held_end
+
+    print(f"\n{cfg['label']}:")
+    print(f"  Test started (left 0)  at t={t_start:.2f}s")
+    print(f"  -> {cfg['target_hi']} deg  converged at t={t_conv_hi:.2f}s  (rise dt = {rise_duration:.2f}s)")
+    print(f"  Left held phase        at t={t_held_end:.2f}s")
+    print(f"  -> {cfg['target_lo']} deg  converged at t={t_conv_lo:.2f}s  (descent dt = {descent_duration:.2f}s)")
+
+    # 3-phase fill
+    ax.fill_between(t_arr, sig_arr, 0, where=phase1,
+                    color=COLOR_CONVERGING_HI, alpha=0.28, interpolate=True)
+    ax.fill_between(t_arr, sig_arr, 0, where=phase2,
+                    color=COLOR_HELD, alpha=0.28, interpolate=True)
+    ax.fill_between(t_arr, sig_arr, 0, where=phase3,
+                    color=COLOR_CONVERGING_LO, alpha=0.28, interpolate=True)
+
+    # Signal line
+    ax.plot(t_arr, sig_arr, color=cfg["color"], linewidth=1.6, zorder=5)
+
+    # Target reference lines
+    ax.axhline(cfg["target_hi"], color=COLOR_CONVERGING_HI,
+               linewidth=1.0, linestyle='--', alpha=0.65)
+    ax.axhline(cfg["target_lo"], color=COLOR_CONVERGING_LO,
+               linewidth=1.0, linestyle='--', alpha=0.65)
+
+    # Y limits
+    y_lo  = min(sig_arr.min() - 5, -5)
+    y_hi  = sig_arr.max() + 20
+    ax.set_ylim(y_lo, y_hi)
+    yspan = y_hi - y_lo
+    xspan = t_arr[-1] - t_arr[0]
+
+    # Dotted line at test start
+    ax.axvline(t_start, color=COLOR_CONVERGING_HI,
+               linewidth=0.8, linestyle=':', alpha=0.5, zorder=3)
+
+    # Rise annotation — BOTTOM of plot
+    ax.axvline(t_conv_hi, color=COLOR_CONVERGING_HI,
+               linewidth=1.2, linestyle='--', alpha=0.85, zorder=4)
+    ax.text(
+        t_conv_hi - 0.015 * xspan, y_lo + 0.08 * yspan,
+        f"dt = {rise_duration:.2f} s\n(-> {cfg['target_hi']} deg)",
+        color=COLOR_CONVERGING_HI, fontsize=BASE_FONT_SIZE - 2, va='bottom', ha='right',
+        bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                  edgecolor=COLOR_CONVERGING_HI, linewidth=0.9, alpha=0.92),
+        zorder=7,
+    )
+
+    # Descent annotation — TOP of plot (unchanged)
+    ax.axvline(t_conv_lo, color=COLOR_CONVERGING_LO,
+               linewidth=1.2, linestyle='--', alpha=0.85, zorder=4)
+    ax.text(
+        t_conv_lo - 0.015 * xspan, y_lo + 0.74 * yspan,
+        f"dt = {descent_duration:.2f} s\n(-> {cfg['target_lo']} deg)",
+        color=COLOR_CONVERGING_LO, fontsize=BASE_FONT_SIZE - 2, va='center', ha='right',
+        bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                  edgecolor=COLOR_CONVERGING_LO, linewidth=0.9, alpha=0.92),
+        zorder=7,
+    )
+
+    # Dotted line at held_end
+    ax.axvline(t_held_end, color=COLOR_CONVERGING_LO,
+               linewidth=0.8, linestyle=':', alpha=0.5, zorder=3)
+
+    ax.set_title(
+        f"{cfg['label']}  |  Target: {cfg['target_hi']} deg -> {cfg['target_lo']} deg"
+        f"   (thresholds: +/-{cfg['thresh_hi']} deg / +/-{cfg['thresh_lo']} deg)",
+        fontsize=BASE_FONT_SIZE,
+        loc='left',
+        pad=6,
+    )
+    ax.set_ylabel(cfg["ylabel"], fontsize=BASE_FONT_SIZE)
+    ax.set_xlabel("Time (s)", fontsize=BASE_FONT_SIZE)
+    ax.tick_params(which='both', direction='in', labelsize=BASE_FONT_SIZE - 1)
+    ax.grid(True, linestyle='--', alpha=0.4)
+
+# ──────────────────────────────────────────────
+# SHARED LEGEND
+# ──────────────────────────────────────────────
+legend_patches = [
+    mpatches.Patch(color=COLOR_CONVERGING_HI, alpha=0.55, label='Converging to target angle'),
+    mpatches.Patch(color=COLOR_HELD,          alpha=0.55, label='Held at target (settling)'),
+    mpatches.Patch(color=COLOR_CONVERGING_LO, alpha=0.55, label='Converging back to 0 deg'),
+]
+fig.legend(
+    handles=legend_patches, loc='lower center', ncol=3,
+    frameon=True, framealpha=0.95, edgecolor='#BBBBBB',
+    bbox_to_anchor=(0.5, 0.01), fontsize=BASE_FONT_SIZE,
+)
+
+plt.savefig("rpy_convergence.png", dpi=300, bbox_inches='tight')
+plt.savefig("rpy_convergence.pdf", bbox_inches='tight')
+plt.show()
+print("\nSaved: rpy_convergence.png  |  rpy_convergence.pdf")
