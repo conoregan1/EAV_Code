@@ -16,7 +16,7 @@ SMOOTHING_WINDOW    = 20     # number of points for rolling average smoothing
 
 # Line width tuning
 LINE_WIDTH_SMALL_MAP = 12   # line width for maps <= SMALL_MAP_THRESHOLD km^2
-LINE_WIDTH_LARGE_MAP = 4    # line width for larger maps
+LINE_WIDTH_LARGE_MAP = 3    # line width for larger maps
 SMALL_MAP_THRESHOLD  = 10.0  # km^2 - maps at or below this use the wider line
 
 # Velocity colour scaling
@@ -176,21 +176,17 @@ def plot_velocity_map(df, df_bat):
           f"full range {v.min():.2f}-{v.max():.2f} m/s")
 
     # Build finite bounds for both the norm and the colourbar.
-    # Using only finite values avoids the matplotlib "Axis limits cannot be
-    # NaN or Inf" crash that occurs when +-inf sentinels are passed to
-    # BoundaryNorm or fig.colorbar. BoundaryNorm naturally clamps any values
-    # outside the boundary range, so the sentinels are not needed.
     band_width    = (v_high - v_low) / (N_VELOCITY_COLOURS - 2)
     inner_edges   = np.linspace(v_low, v_high, N_VELOCITY_COLOURS - 1)
     finite_bounds = np.concatenate((
-        [v_low  - band_width],   # finite stand-in for -inf (tail band)
-        inner_edges,             # 9 real inner edges (all finite)
-        [v_high + band_width],   # finite stand-in for +inf (tail band)
+        [v_low  - band_width],
+        inner_edges,
+        [v_high + band_width],
     ))
 
     norm = mcolors.BoundaryNorm(finite_bounds, ncolors=N_VELOCITY_COLOURS)
 
-    fig, ax = plt.subplots(figsize=(12, 12))
+    fig, ax = plt.subplots(figsize=(12, 9))
 
     lons = df['Long'].values
     lats = df['Lat'].values
@@ -214,6 +210,13 @@ def plot_velocity_map(df, df_bat):
     except Exception as e:
         print(f"Warning: could not load map tiles: {e}")
 
+    # Crop axes tightly to data extent with a small margin, avoiding the
+    # whitespace caused by set_aspect('equal') fighting the OSM basemap tiling
+    margin_lon = (lons.max() - lons.min()) * 0.02
+    margin_lat = (lats.max() - lats.min()) * 0.02
+    ax.set_xlim(lons.min() - margin_lon, lons.max() + margin_lon)
+    ax.set_ylim(lats.min() - margin_lat, lats.max() + margin_lat)
+
     gps_bat = df_bat[df_bat['has_gps']].copy()
     if not gps_bat.empty:
         ax.scatter(
@@ -225,11 +228,12 @@ def plot_velocity_map(df, df_bat):
 
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04,
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.01,
+                        shrink=1,
                         boundaries=finite_bounds,
                         ticks=finite_bounds)
     cbar.set_label(
-        f"Velocity (m/s)  [bottom/top {TAIL_PERCENTILE}% clamped]",
+        f"Velocity (m/s)",
         rotation=270, labelpad=22
     )
     tick_labels = (
@@ -239,12 +243,9 @@ def plot_velocity_map(df, df_bat):
     )
     cbar.set_ticklabels(tick_labels)
 
-    ax.set_title(
-        f"GPS Velocity Map - {datetime.now().strftime('%Y-%m-%d')}",
-        fontsize=16
-    )
-    ax.set_aspect('equal')
-    plt.tight_layout()
+    ax.set_xlabel("Longitude (°)", fontsize=13)
+    ax.set_ylabel("Latitude (°)", fontsize=13)
+    plt.tight_layout(pad=0.5)
     plt.show()
 
 
