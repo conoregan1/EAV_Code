@@ -328,7 +328,7 @@ def plot_velocity_per_run(runs, forward_axis, smoothing_window,
             t, v, cruise_tolerance
         )
 
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(8, 4))
 
         # --- Phase shading ------------------------------------------
         ax.fill_between(t, 0, v, where=accel_mask,
